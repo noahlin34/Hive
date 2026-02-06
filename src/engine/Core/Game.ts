@@ -23,6 +23,7 @@ const GROUND_ROW = GRID_ROWS - 2;
 const STARTING_FUNDS = 100000;
 const OFFICE_TEXTURE_PATH: string | null = '/office.jpg';
 const OFFICE_ACTIVE_TEXTURE_PATH: string | null = '/office_active.jpg';
+const OFFICE_WIDE_TEXTURE_PATH: string | null = '/office_wide.png';
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -120,6 +121,9 @@ export class Game {
   private officeActiveTexture: HTMLImageElement | null = null;
   private officeActiveTextureLoaded = false;
   private officeActiveTexturePath: string | null = null;
+  private officeWideTexture: HTMLImageElement | null = null;
+  private officeWideTextureLoaded = false;
+  private officeWideTexturePath: string | null = null;
   private activeOfficeTiles = new Set<string>();
 
   private lastProcessedGameMinute = 0;
@@ -157,6 +161,7 @@ export class Game {
 
     this.setOfficeTexturePath(OFFICE_TEXTURE_PATH);
     this.setOfficeActiveTexturePath(OFFICE_ACTIVE_TEXTURE_PATH);
+    this.setOfficeWideTexturePath(OFFICE_WIDE_TEXTURE_PATH);
   }
 
   public start(): void {
@@ -265,6 +270,46 @@ export class Game {
       this.worldLayerDirty = true;
     };
     image.src = this.officeActiveTexturePath;
+  }
+
+  public setOfficeWideTexturePath(path: string | null): void {
+    const trimmed = path?.trim() ?? '';
+    if (!trimmed) {
+      this.officeWideTexturePath = null;
+    } else if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:')
+    ) {
+      this.officeWideTexturePath = trimmed;
+    } else {
+      this.officeWideTexturePath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    }
+
+    this.officeWideTexture = null;
+    this.officeWideTextureLoaded = false;
+
+    if (!this.officeWideTexturePath) {
+      this.worldLayerDirty = true;
+      return;
+    }
+
+    const requestedPath = this.officeWideTexturePath;
+    const image = new Image();
+    image.onload = () => {
+      if (this.officeWideTexturePath !== requestedPath) {
+        return;
+      }
+      this.officeWideTexture = image;
+      this.officeWideTextureLoaded = true;
+      this.worldLayerDirty = true;
+    };
+    image.onerror = () => {
+      this.officeWideTexture = null;
+      this.officeWideTextureLoaded = false;
+      this.worldLayerDirty = true;
+    };
+    image.src = this.officeWideTexturePath;
   }
 
   public setPointerPosition(pixelX: number, pixelY: number): void {
@@ -1254,6 +1299,43 @@ export class Game {
               : '#fde68a';
 
       if (floor.zone === 'OFFICE' && floor.occupied) {
+        const span = floor.officeSpan ?? 'SINGLE';
+        if (span === 'RIGHT') {
+          const leftFloor = this.getFloorAt(position.x - 1, position.y);
+          if (
+            leftFloor &&
+            leftFloor.occupied &&
+            leftFloor.zone === 'OFFICE' &&
+            leftFloor.officeSpan === 'LEFT'
+          ) {
+            continue;
+          }
+        }
+
+        if (
+          span === 'LEFT' &&
+          this.officeWideTextureLoaded &&
+          this.officeWideTexture
+        ) {
+          const rightFloor = this.getFloorAt(position.x + 1, position.y);
+          const isValidWidePair =
+            rightFloor !== null &&
+            rightFloor.occupied &&
+            rightFloor.zone === 'OFFICE' &&
+            rightFloor.officeSpan === 'RIGHT';
+
+          if (isValidWidePair) {
+            this.worldContext.drawImage(
+              this.officeWideTexture,
+              tile.x,
+              tile.y,
+              this.grid.cellSize * 2,
+              this.grid.cellSize,
+            );
+            continue;
+          }
+        }
+
         const officeKey = this.cellKey(position.x, position.y);
         const active = this.activeOfficeTiles.has(officeKey);
         const texture =
@@ -1338,6 +1420,22 @@ export class Game {
 
   private cellKey(x: number, y: number): string {
     return `${x},${y}`;
+  }
+
+  private getFloorAt(x: number, y: number) {
+    for (const floorEntity of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(floorEntity, 'position');
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!position || !floor) {
+        continue;
+      }
+
+      if (position.x === x && position.y === y) {
+        return floor;
+      }
+    }
+
+    return null;
   }
 
   private areEqualSets(a: Set<string>, b: Set<string>): boolean {

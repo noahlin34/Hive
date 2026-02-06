@@ -89,6 +89,7 @@ export interface Schedule {
 }
 
 export type RoomZone = 'HALLWAY' | 'LOBBY' | 'OFFICE' | 'CONDO' | 'FOOD_COURT';
+export type OfficeSpan = 'SINGLE' | 'LEFT' | 'RIGHT';
 
 export interface Floor {
   kind: 'floor';
@@ -96,6 +97,7 @@ export interface Floor {
   occupied: boolean;
   rent: number;
   windowSeed: number;
+  officeSpan: OfficeSpan | null;
 }
 
 export interface Elevator {
@@ -796,7 +798,8 @@ export class MouseSystem {
       };
     }
 
-    for (const cell of footprint) {
+    for (let index = 0; index < footprint.length; index += 1) {
+      const cell = footprint[index];
       const floorEntity = this.getEntityByTypeAt(cell, 'floor');
       if (floorEntity === null) {
         continue;
@@ -815,6 +818,14 @@ export class MouseSystem {
             : 'FOOD_COURT';
       floor.occupied = true;
       floor.rent = floor.zone === 'FOOD_COURT' ? 0 : 100;
+      floor.officeSpan =
+        floor.zone === 'OFFICE'
+          ? footprint.length >= 2
+            ? index === 0
+              ? 'LEFT'
+              : 'RIGHT'
+            : 'SINGLE'
+          : null;
 
       if (floor.zone === 'OFFICE') {
         this.world.addComponent(floorEntity, 'influence', {
@@ -884,6 +895,10 @@ export class MouseSystem {
       return [anchor];
     }
 
+    if (tool === Tool.OFFICE) {
+      return this.getOfficeFootprint(anchor);
+    }
+
     const width = tool === Tool.FOOD_COURT ? 3 : 2;
     const footprint: GridCell[] = [];
 
@@ -892,6 +907,30 @@ export class MouseSystem {
     }
 
     return footprint;
+  }
+
+  private getOfficeFootprint(anchor: GridCell): GridCell[] {
+    const nextCell = { x: anchor.x + 1, y: anchor.y };
+
+    if (this.canOfficeTileSupport(anchor) && this.canOfficeTileSupport(nextCell)) {
+      return [anchor, nextCell];
+    }
+
+    return [anchor];
+  }
+
+  private canOfficeTileSupport(cell: GridCell): boolean {
+    const floorEntity = this.getEntityByTypeAt(cell, 'floor');
+    if (floorEntity === null) {
+      return false;
+    }
+
+    const floor = this.world.getComponent(floorEntity, 'floor');
+    if (!floor) {
+      return false;
+    }
+
+    return floor.zone === 'HALLWAY' || floor.zone === 'LOBBY';
   }
 
   private spawnFloorSegment(cell: GridCell): void {
@@ -903,6 +942,7 @@ export class MouseSystem {
       occupied: true,
       rent: 0,
       windowSeed: Math.floor(pseudoRandom(entity + cell.x * 17 + cell.y * 31) * 10000),
+      officeSpan: null,
     });
   }
 
