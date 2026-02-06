@@ -193,6 +193,7 @@ const STRESS_DECAY_PER_SECOND = 2.2;
 
 const DISPATCH_DIRECTION_PENALTY = 8;
 const AGENT_SPRITE_PATH = '/agent.png';
+const AGENT_FACING_EPSILON = 0.002;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -323,6 +324,8 @@ export class RenderSystem {
   private readonly projector: GridProjector;
   private agentSprite: HTMLCanvasElement | null = null;
   private agentSpriteLoaded = false;
+  private readonly agentFacingRight = new Map<EntityId, boolean>();
+  private readonly previousAgentX = new Map<EntityId, number>();
 
   public constructor(world: ECSWorld, projector: GridProjector) {
     this.world = world;
@@ -401,12 +404,33 @@ export class RenderSystem {
   }
 
   private renderShapes(ctx: CanvasRenderingContext2D): void {
+    const seenAgentIds = new Set<EntityId>();
+
     for (const entityId of this.world.query('position', 'renderable')) {
       const position = this.world.getComponent(entityId, 'position');
       const renderable = this.world.getComponent(entityId, 'renderable');
 
       if (!position || !renderable) {
         continue;
+      }
+
+      const agent = this.world.getComponent(entityId, 'agent');
+      if (agent) {
+        seenAgentIds.add(entityId);
+        const previousX = this.previousAgentX.get(entityId);
+
+        if (previousX !== undefined) {
+          const deltaX = position.x - previousX;
+          if (deltaX > AGENT_FACING_EPSILON) {
+            this.agentFacingRight.set(entityId, true);
+          } else if (deltaX < -AGENT_FACING_EPSILON) {
+            this.agentFacingRight.set(entityId, false);
+          }
+        } else if (!this.agentFacingRight.has(entityId)) {
+          this.agentFacingRight.set(entityId, true);
+        }
+
+        this.previousAgentX.set(entityId, position.x);
       }
 
       if (renderable.hidden) {
@@ -418,10 +442,18 @@ export class RenderSystem {
       const offset = (this.projector.cellSize - size) * 0.5;
       const drawX = pixelX + offset;
       const drawY = pixelY + offset;
-      const agent = this.world.getComponent(entityId, 'agent');
 
       if (agent && this.agentSpriteLoaded && this.agentSprite) {
-        ctx.drawImage(this.agentSprite, drawX, drawY, size, size);
+        const facingRight = this.agentFacingRight.get(entityId) ?? true;
+        if (facingRight) {
+          ctx.drawImage(this.agentSprite, drawX, drawY, size, size);
+        } else {
+          ctx.save();
+          ctx.translate(drawX + size, drawY);
+          ctx.scale(-1, 1);
+          ctx.drawImage(this.agentSprite, 0, 0, size, size);
+          ctx.restore();
+        }
       } else {
         if (renderable.shape === 'circle') {
           const radius = size * 0.5;
@@ -446,6 +478,15 @@ export class RenderSystem {
         ctx.lineWidth = 2;
         ctx.strokeRect(drawX + 2, drawY + 2, size - 4, size - 4);
       }
+    }
+
+    for (const entityId of Array.from(this.previousAgentX.keys())) {
+      if (seenAgentIds.has(entityId)) {
+        continue;
+      }
+
+      this.previousAgentX.delete(entityId);
+      this.agentFacingRight.delete(entityId);
     }
   }
 
