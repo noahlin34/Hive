@@ -17,6 +17,7 @@ export interface Renderable {
   color: string;
   shape: 'square' | 'circle';
   sizeScale?: number;
+  hidden?: boolean;
 }
 
 export type AgentMood = 'happy' | 'neutral' | 'angry';
@@ -401,6 +402,10 @@ export class RenderSystem {
       const renderable = this.world.getComponent(entityId, 'renderable');
 
       if (!position || !renderable) {
+        continue;
+      }
+
+      if (renderable.hidden) {
         continue;
       }
 

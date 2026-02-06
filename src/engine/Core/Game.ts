@@ -15,13 +15,14 @@ import { GameLoop } from './Loop';
 import { GridRenderer, GridSystem, type GridCell } from '../Renderer/GridRenderer';
 import { Tool } from './Tools';
 
-const GRID_CELL_SIZE = 32;
+const GRID_CELL_SIZE = 64;
 const GRID_COLUMNS = 30;
 const GRID_ROWS = 20;
 const GROUND_ROW = GRID_ROWS - 2;
 
 const STARTING_FUNDS = 100000;
 const OFFICE_TEXTURE_PATH: string | null = '/office.jpg';
+const OFFICE_ACTIVE_TEXTURE_PATH: string | null = '/office_active.jpg';
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -83,11 +84,6 @@ export const GAME_VIEWPORT = {
   height: GRID_ROWS * GRID_CELL_SIZE,
 } as const;
 
-function pseudoRandom(seed: number): number {
-  const x = Math.sin(seed * 12.9898) * 43758.5453;
-  return x - Math.floor(x);
-}
-
 export function formatGameTime(elapsedMinutes: number): string {
   const normalizedMinutes =
     ((elapsedMinutes % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
@@ -121,6 +117,10 @@ export class Game {
   private officeTexture: HTMLImageElement | null = null;
   private officeTextureLoaded = false;
   private officeTexturePath: string | null = null;
+  private officeActiveTexture: HTMLImageElement | null = null;
+  private officeActiveTextureLoaded = false;
+  private officeActiveTexturePath: string | null = null;
+  private activeOfficeTiles = new Set<string>();
 
   private lastProcessedGameMinute = 0;
   private lastPublishedGameMinute = -1;
@@ -156,6 +156,7 @@ export class Game {
     });
 
     this.setOfficeTexturePath(OFFICE_TEXTURE_PATH);
+    this.setOfficeActiveTexturePath(OFFICE_ACTIVE_TEXTURE_PATH);
   }
 
   public start(): void {
@@ -163,6 +164,7 @@ export class Game {
     this.lastPublishedGameMinute = -1;
     this.lastSkySlot = -1;
     this.nextAgentId = 1;
+    this.activeOfficeTiles = new Set<string>();
 
     gameStateStore.setState({
       money: STARTING_FUNDS,
@@ -223,6 +225,46 @@ export class Game {
       this.worldLayerDirty = true;
     };
     image.src = this.officeTexturePath;
+  }
+
+  public setOfficeActiveTexturePath(path: string | null): void {
+    const trimmed = path?.trim() ?? '';
+    if (!trimmed) {
+      this.officeActiveTexturePath = null;
+    } else if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:')
+    ) {
+      this.officeActiveTexturePath = trimmed;
+    } else {
+      this.officeActiveTexturePath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    }
+
+    this.officeActiveTexture = null;
+    this.officeActiveTextureLoaded = false;
+
+    if (!this.officeActiveTexturePath) {
+      this.worldLayerDirty = true;
+      return;
+    }
+
+    const requestedPath = this.officeActiveTexturePath;
+    const image = new Image();
+    image.onload = () => {
+      if (this.officeActiveTexturePath !== requestedPath) {
+        return;
+      }
+      this.officeActiveTexture = image;
+      this.officeActiveTextureLoaded = true;
+      this.worldLayerDirty = true;
+    };
+    image.onerror = () => {
+      this.officeActiveTexture = null;
+      this.officeActiveTextureLoaded = false;
+      this.worldLayerDirty = true;
+    };
+    image.src = this.officeActiveTexturePath;
   }
 
   public setPointerPosition(pixelX: number, pixelY: number): void {
@@ -351,6 +393,7 @@ export class Game {
 
     this.agentSystem.update(deltaMs);
     this.elevatorSystem.update(deltaMs);
+    this.refreshOfficeOccupancy();
 
     const zoningChanged = this.zoningSystem.update(deltaMs);
     if (zoningChanged) {
@@ -1136,10 +1179,6 @@ export class Game {
     return ((totalMinute % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
   }
 
-  private isNight(minuteOfDay: number): boolean {
-    return minuteOfDay >= 19 * 60 || minuteOfDay < 6 * 60;
-  }
-
   private renderFrame(): void {
     if (this.worldLayerDirty) {
       this.renderWorldLayer();
@@ -1180,8 +1219,7 @@ export class Game {
   }
 
   private drawPlacedStructures(minuteOfDay: number): void {
-    const night = this.isNight(minuteOfDay);
-    const twinklePhase = Math.floor(this.lastProcessedGameMinute / 30);
+    void minuteOfDay;
 
     for (const entityId of this.world.query('position', 'floor')) {
       const position = this.world.getComponent(entityId, 'position');
@@ -1215,40 +1253,28 @@ export class Game {
               ? '#99f6e4'
               : '#fde68a';
 
-      if (floor.zone === 'OFFICE' && floor.occupied && this.officeTextureLoaded && this.officeTexture) {
-        this.worldContext.drawImage(
-          this.officeTexture,
-          tile.x,
-          tile.y,
-          this.grid.cellSize,
-          this.grid.cellSize,
-        );
-      } else {
-        this.worldContext.fillStyle = floor.occupied ? zoneColor : 'rgba(51, 65, 85, 0.7)';
-        this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, this.grid.cellSize);
+      if (floor.zone === 'OFFICE' && floor.occupied) {
+        const officeKey = this.cellKey(position.x, position.y);
+        const active = this.activeOfficeTiles.has(officeKey);
+        const texture =
+          active && this.officeActiveTextureLoaded && this.officeActiveTexture
+            ? this.officeActiveTexture
+            : this.officeTextureLoaded && this.officeTexture
+              ? this.officeTexture
+              : null;
 
-        this.worldContext.fillStyle = floor.occupied ? topAccent : 'rgba(148, 163, 184, 0.45)';
-        this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, 6);
-      }
-
-      const canLightWindows =
-        floor.occupied && floor.zone !== 'HALLWAY' && floor.zone !== 'LOBBY';
-
-      if (night && canLightWindows) {
-        for (let index = 0; index < 4; index += 1) {
-          const seed = floor.windowSeed + index * 17 + twinklePhase * 5;
-          const lightChance = pseudoRandom(seed);
-          if (lightChance < 0.42) {
-            continue;
-          }
-
-          const localX = (index % 2) * 12 + 7;
-          const localY = Math.floor(index / 2) * 10 + 10;
-
-          this.worldContext.fillStyle = 'rgba(255, 241, 179, 0.92)';
-          this.worldContext.fillRect(tile.x + localX, tile.y + localY, 4, 4);
+        if (texture) {
+          this.worldContext.drawImage(texture, tile.x, tile.y, this.grid.cellSize, this.grid.cellSize);
+          continue;
         }
       }
+
+      this.worldContext.fillStyle = floor.occupied ? zoneColor : 'rgba(51, 65, 85, 0.7)';
+      this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, this.grid.cellSize);
+
+      this.worldContext.fillStyle = floor.occupied ? topAccent : 'rgba(148, 163, 184, 0.45)';
+      this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, 6);
+
     }
 
     for (const entityId of this.world.query('position', 'elevator')) {
@@ -1270,6 +1296,62 @@ export class Game {
         this.grid.cellSize - 6,
       );
     }
+  }
+
+  private refreshOfficeOccupancy(): void {
+    const officeTiles = new Set<string>();
+    for (const floorEntity of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(floorEntity, 'position');
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!position || !floor || !floor.occupied || floor.zone !== 'OFFICE') {
+        continue;
+      }
+
+      officeTiles.add(this.cellKey(position.x, position.y));
+    }
+
+    const activeOfficeTiles = new Set<string>();
+    for (const agentEntity of this.world.query('position', 'agent', 'renderable')) {
+      const position = this.world.getComponent(agentEntity, 'position');
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      const renderable = this.world.getComponent(agentEntity, 'renderable');
+      if (!position || !agent || !renderable) {
+        continue;
+      }
+
+      const tileX = Math.round(position.x);
+      const tileY = Math.round(position.y);
+      const tileKey = this.cellKey(tileX, tileY);
+      const isInsideOffice = agent.phase === 'AT_TARGET' && officeTiles.has(tileKey);
+
+      renderable.hidden = isInsideOffice;
+      if (isInsideOffice) {
+        activeOfficeTiles.add(tileKey);
+      }
+    }
+
+    if (!this.areEqualSets(this.activeOfficeTiles, activeOfficeTiles)) {
+      this.activeOfficeTiles = activeOfficeTiles;
+      this.worldLayerDirty = true;
+    }
+  }
+
+  private cellKey(x: number, y: number): string {
+    return `${x},${y}`;
+  }
+
+  private areEqualSets(a: Set<string>, b: Set<string>): boolean {
+    if (a.size !== b.size) {
+      return false;
+    }
+
+    for (const value of a) {
+      if (!b.has(value)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private renderSimulationLayer(): void {
