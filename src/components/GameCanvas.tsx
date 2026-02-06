@@ -4,13 +4,14 @@ import { GAME_VIEWPORT, Game } from '../engine/Core/Game';
 import type { Tool } from '../engine/Core/Tools';
 
 interface GameCanvasProps {
-  selectedTool: Tool;
+  selectedTool: Tool | null;
 }
 
 export function GameCanvas({ selectedTool }: GameCanvasProps) {
   const worldCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const simulationCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const gameRef = useRef<Game | null>(null);
+  const pendingPrimaryActionRef = useRef<number | null>(null);
 
   useEffect(() => {
     const worldCanvas = worldCanvasRef.current;
@@ -25,6 +26,10 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
     game.start();
 
     return () => {
+      if (pendingPrimaryActionRef.current !== null) {
+        window.clearTimeout(pendingPrimaryActionRef.current);
+        pendingPrimaryActionRef.current = null;
+      }
       game.dispose();
       gameRef.current = null;
     };
@@ -58,12 +63,20 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
   };
 
   const handlePointerLeave = (): void => {
+    if (pendingPrimaryActionRef.current !== null) {
+      window.clearTimeout(pendingPrimaryActionRef.current);
+      pendingPrimaryActionRef.current = null;
+    }
     gameRef.current?.clearPointer();
     gameRef.current?.cancelPrimaryAction();
   };
 
   const handlePointerDown = (event: MouseEvent<HTMLCanvasElement>): void => {
     if (event.button !== 0) {
+      return;
+    }
+
+    if (event.detail >= 2) {
       return;
     }
 
@@ -87,7 +100,21 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
     }
 
     const pointer = getScaledPointerPosition(event);
-    game.endPrimaryAction(pointer.x, pointer.y);
+    if (pendingPrimaryActionRef.current !== null) {
+      window.clearTimeout(pendingPrimaryActionRef.current);
+      pendingPrimaryActionRef.current = null;
+    }
+
+    if (event.detail >= 2) {
+      game.cancelPrimaryAction();
+      game.handleInspectDoubleClick(pointer.x, pointer.y);
+      return;
+    }
+
+    pendingPrimaryActionRef.current = window.setTimeout(() => {
+      game.endPrimaryAction(pointer.x, pointer.y);
+      pendingPrimaryActionRef.current = null;
+    }, 220);
   };
 
   const handleContextMenu = (event: MouseEvent<HTMLCanvasElement>): void => {
@@ -100,6 +127,22 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
 
     const pointer = getScaledPointerPosition(event);
     game.handleCommandClick(pointer.x, pointer.y);
+  };
+
+  const handleDoubleClick = (event: MouseEvent<HTMLCanvasElement>): void => {
+    const game = gameRef.current;
+    if (!game) {
+      return;
+    }
+
+    if (pendingPrimaryActionRef.current !== null) {
+      window.clearTimeout(pendingPrimaryActionRef.current);
+      pendingPrimaryActionRef.current = null;
+    }
+
+    const pointer = getScaledPointerPosition(event);
+    game.cancelPrimaryAction();
+    game.handleInspectDoubleClick(pointer.x, pointer.y);
   };
 
   return (
@@ -124,6 +167,7 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
         onMouseDown={handlePointerDown}
         onMouseUp={handlePointerUp}
         onContextMenu={handleContextMenu}
+        onDoubleClick={handleDoubleClick}
       />
     </div>
   );

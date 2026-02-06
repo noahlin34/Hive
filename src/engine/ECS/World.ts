@@ -98,6 +98,7 @@ export interface Floor {
   rent: number;
   windowSeed: number;
   officeSpan: OfficeSpan | null;
+  roomId: number | null;
 }
 
 export interface Elevator {
@@ -621,6 +622,7 @@ export class MouseSystem {
   private readonly world: ECSWorld;
   private readonly groundRow: number;
   private hoveredCell: GridCell | null = null;
+  private nextRoomId = 1;
 
   public constructor(world: ECSWorld, groundRow: number) {
     this.world = world;
@@ -798,6 +800,9 @@ export class MouseSystem {
       };
     }
 
+    const roomId = this.nextRoomId;
+    this.nextRoomId += 1;
+
     for (let index = 0; index < footprint.length; index += 1) {
       const cell = footprint[index];
       const floorEntity = this.getEntityByTypeAt(cell, 'floor');
@@ -826,6 +831,7 @@ export class MouseSystem {
               : 'RIGHT'
             : 'SINGLE'
           : null;
+      floor.roomId = roomId;
 
       if (floor.zone === 'OFFICE') {
         this.world.addComponent(floorEntity, 'influence', {
@@ -943,6 +949,7 @@ export class MouseSystem {
       rent: 0,
       windowSeed: Math.floor(pseudoRandom(entity + cell.x * 17 + cell.y * 31) * 10000),
       officeSpan: null,
+      roomId: null,
     });
   }
 

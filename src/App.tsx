@@ -12,8 +12,12 @@ const TOOL_ORDER: Tool[] = [
   Tool.DELETE,
 ];
 
+function roomZoneLabel(zone: string): string {
+  return zone.replaceAll('_', ' ');
+}
+
 function App() {
-  const [selectedTool, setSelectedTool] = useState<Tool>(Tool.FLOOR);
+  const [selectedTool, setSelectedTool] = useState<Tool | null>(Tool.FLOOR);
 
   const gameState = useSyncExternalStore(
     gameStateStore.subscribe,
@@ -36,7 +40,9 @@ function App() {
               <button
                 key={tool}
                 type="button"
-                onClick={() => setSelectedTool(tool)}
+                onClick={() => {
+                  setSelectedTool((current) => (current === tool ? null : tool));
+                }}
                 className={`rounded px-3 py-2 text-sm font-medium transition ${
                   isSelected
                     ? 'bg-sky-500 text-slate-950'
@@ -50,7 +56,8 @@ function App() {
           })}
 
           <p className="ml-2 text-xs text-slate-400">
-            Drag with Floor to lay segments ($10 each). Rooms require floor support. Right click sends an agent.
+            Drag with Floor to lay segments ($10 each). Rooms require floor support. Right click sends an
+            agent. Click a selected tool again to deselect. Double click a room to inspect it.
           </p>
         </section>
 
@@ -72,6 +79,25 @@ function App() {
                 </p>
               ) : null}
             </section>
+
+            {gameState.inspectedRoom ? (
+              <section className="pointer-events-none absolute right-4 top-4 rounded-md border border-slate-600/60 bg-slate-900/88 px-4 py-3 shadow-xl backdrop-blur-sm">
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Room Inspector</p>
+                <p className="text-sm font-semibold">
+                  {roomZoneLabel(gameState.inspectedRoom.zone)} #{gameState.inspectedRoom.roomId}
+                </p>
+                <p className="text-sm text-slate-200">
+                  Rent: ${gameState.inspectedRoom.totalRent.toLocaleString()} / day
+                </p>
+                <p className="text-sm text-slate-200">
+                  {gameState.inspectedRoom.assignedLabel}: {gameState.inspectedRoom.assignedCount}
+                </p>
+                <p className="text-sm text-slate-200">
+                  Occupancy: {gameState.inspectedRoom.occupancyCount}/
+                  {gameState.inspectedRoom.occupancyCapacity} ({gameState.inspectedRoom.occupancyPercent}%)
+                </p>
+              </section>
+            ) : null}
           </div>
         </div>
       </div>

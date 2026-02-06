@@ -5,6 +5,7 @@ import {
   type EntityId,
   ECSWorld,
   ElevatorSystem,
+  type Floor,
   FloatingTextSystem,
   MouseSystem,
   RenderSystem,
@@ -39,10 +40,25 @@ const RESIDENT_WORKER_SHARE = 0.45;
 
 type StoreListener = () => void;
 
+export type InspectableRoomZone = 'OFFICE' | 'CONDO' | 'FOOD_COURT';
+
+export interface RoomInspection {
+  roomId: number;
+  zone: InspectableRoomZone;
+  tileCount: number;
+  totalRent: number;
+  assignedCount: number;
+  assignedLabel: 'Employees' | 'Residents';
+  occupancyCount: number;
+  occupancyCapacity: number;
+  occupancyPercent: number;
+}
+
 export interface GameState {
   money: number;
   elapsedMinutes: number;
   statusMessage: string | null;
+  inspectedRoom: RoomInspection | null;
 }
 
 class GameStateStore {
@@ -78,6 +94,7 @@ export const gameStateStore = new GameStateStore({
   money: STARTING_FUNDS,
   elapsedMinutes: 0,
   statusMessage: null,
+  inspectedRoom: null,
 });
 
 export const GAME_VIEWPORT = {
@@ -113,7 +130,7 @@ export class Game {
   private readonly renderSystem = new RenderSystem(this.world, this.grid);
   private readonly loop: GameLoop;
 
-  private selectedTool: Tool = Tool.FLOOR;
+  private selectedTool: Tool | null = Tool.FLOOR;
   private worldLayerDirty = true;
   private officeTexture: HTMLImageElement | null = null;
   private officeTextureLoaded = false;
@@ -175,6 +192,7 @@ export class Game {
       money: STARTING_FUNDS,
       elapsedMinutes: 0,
       statusMessage: null,
+      inspectedRoom: null,
     });
 
     this.worldLayerDirty = true;
@@ -188,7 +206,7 @@ export class Game {
     this.simulationContext.clearRect(0, 0, this.grid.widthPx, this.grid.heightPx);
   }
 
-  public setTool(tool: Tool): void {
+  public setTool(tool: Tool | null): void {
     this.selectedTool = tool;
   }
 
@@ -387,6 +405,11 @@ export class Game {
   public handlePrimaryClick(pixelX: number, pixelY: number): void {
     this.setPointerPosition(pixelX, pixelY);
 
+    if (this.selectedTool === null) {
+      this.setStatus(null);
+      return;
+    }
+
     const funds = gameStateStore.getSnapshot().money;
     const result = this.mouseSystem.applyToolAtHoveredCell(this.selectedTool, funds);
 
@@ -415,6 +438,17 @@ export class Game {
     this.setStatus(null);
   }
 
+  public handleInspectDoubleClick(pixelX: number, pixelY: number): void {
+    const cell = this.grid.screenToGrid(pixelX, pixelY);
+    if (!cell) {
+      gameStateStore.setState({ inspectedRoom: null });
+      return;
+    }
+
+    const inspectedRoom = this.buildRoomInspectionAtCell(cell);
+    gameStateStore.setState({ inspectedRoom });
+  }
+
   private setStatus(message: string | null): void {
     gameStateStore.setState({ statusMessage: message });
   }
@@ -439,6 +473,7 @@ export class Game {
     this.agentSystem.update(deltaMs);
     this.elevatorSystem.update(deltaMs);
     this.refreshOfficeOccupancy();
+    this.refreshInspectedRoom();
 
     const zoningChanged = this.zoningSystem.update(deltaMs);
     if (zoningChanged) {
@@ -906,12 +941,15 @@ export class Game {
     });
   }
 
-  private spawnVisitor(spawnX: number, totalMinute: number): EntityId {
+  private spawnVisitor(spawnX: number, totalMinute: number, autoEnter: boolean = true): EntityId {
+    const ingress = this.resolveIngress(spawnX);
+    const spawnCell = ingress?.spawn ?? { x: spawnX, y: GROUND_ROW };
+    const entryCell = ingress?.entry ?? { x: spawnX, y: GROUND_ROW };
     const visitor = this.world.createEntity();
 
     this.world.addComponent(visitor, 'position', {
-      x: spawnX,
-      y: GROUND_ROW,
+      x: spawnCell.x,
+      y: spawnCell.y,
     });
 
     this.world.addComponent(visitor, 'renderable', {
@@ -932,10 +970,10 @@ export class Game {
       nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 20),
       leaveByMinute: totalMinute + 60 + Math.floor(Math.random() * 180),
       hasLunchedToday: false,
-      sourceFloorY: GROUND_ROW,
-      targetFloorY: GROUND_ROW,
-      targetX: spawnX,
-      targetY: GROUND_ROW,
+      sourceFloorY: spawnCell.y,
+      targetFloorY: spawnCell.y,
+      targetX: spawnCell.x,
+      targetY: spawnCell.y,
       homeX: null,
       homeY: null,
       workX: null,
@@ -948,16 +986,29 @@ export class Game {
       despawnOnArrival: false,
     });
 
+    if (autoEnter && (entryCell.x !== spawnCell.x || entryCell.y !== spawnCell.y)) {
+      const didEnter = this.agentSystem.issueTrip(visitor, entryCell, false);
+      if (didEnter) {
+        const agent = this.world.getComponent(visitor, 'agent');
+        if (agent) {
+          agent.routine = 'VISITING';
+          agent.nextActionMinute = totalMinute + 20 + Math.floor(Math.random() * 25);
+        }
+      }
+    }
+
     this.nextAgentId += 1;
     return visitor;
   }
 
   private spawnResident(home: GridCell, totalMinute: number): EntityId {
+    const ingress = this.resolveIngress(home.x);
+    const spawnCell = ingress?.spawn ?? { x: home.x, y: home.y };
     const resident = this.world.createEntity();
 
     this.world.addComponent(resident, 'position', {
-      x: home.x,
-      y: home.y,
+      x: spawnCell.x,
+      y: spawnCell.y,
     });
 
     this.world.addComponent(resident, 'renderable', {
@@ -969,19 +1020,19 @@ export class Game {
     this.world.addComponent(resident, 'agent', {
       name: `Resident ${this.nextAgentId}`,
       archetype: 'RESIDENT',
-      routine: 'HOME',
+      routine: 'COMMUTING_HOME',
       mood: 'neutral',
       speed: 3,
-      phase: 'AT_TARGET',
+      phase: 'IDLE',
       stress: 0,
       waitMs: 0,
       nextActionMinute: totalMinute + 15 + Math.floor(Math.random() * 35),
       leaveByMinute: null,
       hasLunchedToday: false,
-      sourceFloorY: home.y,
-      targetFloorY: home.y,
-      targetX: home.x,
-      targetY: home.y,
+      sourceFloorY: spawnCell.y,
+      targetFloorY: spawnCell.y,
+      targetX: spawnCell.x,
+      targetY: spawnCell.y,
       homeX: home.x,
       homeY: home.y,
       workX: null,
@@ -994,16 +1045,26 @@ export class Game {
       despawnOnArrival: false,
     });
 
+    const didEnter = this.agentSystem.issueTrip(resident, home, false);
+    if (!didEnter) {
+      const agent = this.world.getComponent(resident, 'agent');
+      if (agent) {
+        agent.routine = 'WANDERING';
+      }
+    }
+
     this.nextAgentId += 1;
     return resident;
   }
 
   private spawnOfficeWorker(homeX: number, officeDesk: GridCell, totalMinute: number): EntityId {
+    const ingress = this.resolveIngress(homeX);
+    const spawnCell = ingress?.spawn ?? { x: homeX, y: GROUND_ROW };
     const worker = this.world.createEntity();
 
     this.world.addComponent(worker, 'position', {
-      x: homeX,
-      y: GROUND_ROW,
+      x: spawnCell.x,
+      y: spawnCell.y,
     });
 
     this.world.addComponent(worker, 'renderable', {
@@ -1024,10 +1085,10 @@ export class Game {
       nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 12),
       leaveByMinute: null,
       hasLunchedToday: false,
-      sourceFloorY: GROUND_ROW,
-      targetFloorY: GROUND_ROW,
-      targetX: homeX,
-      targetY: GROUND_ROW,
+      sourceFloorY: spawnCell.y,
+      targetFloorY: spawnCell.y,
+      targetX: spawnCell.x,
+      targetY: spawnCell.y,
       homeX: null,
       homeY: null,
       workX: officeDesk.x,
@@ -1045,7 +1106,7 @@ export class Game {
   }
 
   private spawnFreelanceAgent(homeX: number): EntityId {
-    return this.spawnVisitor(homeX, this.lastProcessedGameMinute);
+    return this.spawnVisitor(homeX, this.lastProcessedGameMinute, false);
   }
 
   private commandAgentToHoveredFloor(): void {
@@ -1114,6 +1175,33 @@ export class Game {
       x: useLeftExit ? -2 : GRID_COLUMNS + 2,
       y: GROUND_ROW,
     };
+  }
+
+  private resolveIngress(preferredX: number): { spawn: GridCell; entry: GridCell } | null {
+    const lobbies = this.getFloorCellsByZone('LOBBY').filter((cell) => cell.y === GROUND_ROW);
+    if (lobbies.length === 0) {
+      return null;
+    }
+
+    let leftEdge = lobbies[0];
+    let rightEdge = lobbies[0];
+    for (const lobby of lobbies) {
+      if (lobby.x < leftEdge.x) {
+        leftEdge = lobby;
+      }
+      if (lobby.x > rightEdge.x) {
+        rightEdge = lobby;
+      }
+    }
+
+    const entry = this.findNearestCell(lobbies, preferredX) ?? leftEdge;
+    if (leftEdge.x === rightEdge.x) {
+      return { spawn: leftEdge, entry };
+    }
+
+    const midpoint = (leftEdge.x + rightEdge.x) * 0.5;
+    const spawn = preferredX >= midpoint ? leftEdge : rightEdge;
+    return { spawn, entry };
   }
 
   private getAgentsByArchetype(archetype: AgentArchetype): EntityId[] {
@@ -1205,6 +1293,120 @@ export class Game {
     }
 
     return null;
+  }
+
+  private isInspectableZone(zone: RoomZone): zone is InspectableRoomZone {
+    return zone === 'OFFICE' || zone === 'CONDO' || zone === 'FOOD_COURT';
+  }
+
+  private buildRoomInspectionAtCell(cell: GridCell): RoomInspection | null {
+    const floor = this.getFloorAt(cell.x, cell.y);
+    if (!floor || !floor.occupied || floor.roomId === null || !this.isInspectableZone(floor.zone)) {
+      return null;
+    }
+
+    return this.buildRoomInspectionById(floor.roomId);
+  }
+
+  private buildRoomInspectionById(roomId: number): RoomInspection | null {
+    let zone: InspectableRoomZone | null = null;
+    const tiles: GridCell[] = [];
+    let totalRent = 0;
+
+    for (const floorEntity of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(floorEntity, 'position');
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!position || !floor) {
+        continue;
+      }
+
+      if (floor.roomId !== roomId || !floor.occupied || !this.isInspectableZone(floor.zone)) {
+        continue;
+      }
+
+      if (zone === null) {
+        zone = floor.zone;
+      }
+
+      if (floor.zone !== zone) {
+        continue;
+      }
+
+      tiles.push({ x: position.x, y: position.y });
+      totalRent += floor.rent;
+    }
+
+    if (!zone || tiles.length === 0) {
+      return null;
+    }
+
+    const tileKeys = new Set(tiles.map((tile) => this.cellKey(tile.x, tile.y)));
+    let occupancyCount = 0;
+    let assignedCount = 0;
+
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const position = this.world.getComponent(agentEntity, 'position');
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      if (!position || !agent) {
+        continue;
+      }
+
+      const standingKey = this.cellKey(Math.round(position.x), Math.round(position.y));
+      if (tileKeys.has(standingKey)) {
+        occupancyCount += 1;
+      }
+
+      if (zone === 'OFFICE') {
+        if (
+          (agent.archetype === 'OFFICE_WORKER' || agent.archetype === 'RESIDENT') &&
+          agent.workX !== null &&
+          agent.workY !== null &&
+          tileKeys.has(this.cellKey(agent.workX, agent.workY))
+        ) {
+          assignedCount += 1;
+        }
+      } else if (zone === 'CONDO') {
+        if (
+          agent.archetype === 'RESIDENT' &&
+          agent.homeX !== null &&
+          agent.homeY !== null &&
+          tileKeys.has(this.cellKey(agent.homeX, agent.homeY))
+        ) {
+          assignedCount += 1;
+        }
+      }
+    }
+
+    const occupancyCapacityPerTile = zone === 'OFFICE' ? 6 : zone === 'CONDO' ? 3 : 10;
+    const occupancyCapacity = Math.max(1, tiles.length * occupancyCapacityPerTile);
+    const occupancyPercent = Math.min(
+      999,
+      Math.round((occupancyCount / occupancyCapacity) * 100),
+    );
+
+    return {
+      roomId,
+      zone,
+      tileCount: tiles.length,
+      totalRent,
+      assignedCount,
+      assignedLabel: zone === 'CONDO' ? 'Residents' : 'Employees',
+      occupancyCount,
+      occupancyCapacity,
+      occupancyPercent,
+    };
+  }
+
+  private refreshInspectedRoom(): void {
+    const currentInspection = gameStateStore.getSnapshot().inspectedRoom;
+    if (!currentInspection) {
+      return;
+    }
+
+    const refreshed = this.buildRoomInspectionById(currentInspection.roomId);
+    if (!this.isRoomInspectionEqual(currentInspection, refreshed)) {
+      gameStateStore.setState({ inspectedRoom: refreshed });
+    }
   }
 
   private addShopRevenue(amount: number, x: number, y: number): void {
@@ -1422,7 +1624,7 @@ export class Game {
     return `${x},${y}`;
   }
 
-  private getFloorAt(x: number, y: number) {
+  private getFloorAt(x: number, y: number): Floor | null {
     for (const floorEntity of this.world.query('position', 'floor')) {
       const position = this.world.getComponent(floorEntity, 'position');
       const floor = this.world.getComponent(floorEntity, 'floor');
@@ -1436,6 +1638,24 @@ export class Game {
     }
 
     return null;
+  }
+
+  private isRoomInspectionEqual(a: RoomInspection | null, b: RoomInspection | null): boolean {
+    if (!a || !b) {
+      return a === b;
+    }
+
+    return (
+      a.roomId === b.roomId &&
+      a.zone === b.zone &&
+      a.tileCount === b.tileCount &&
+      a.totalRent === b.totalRent &&
+      a.assignedCount === b.assignedCount &&
+      a.assignedLabel === b.assignedLabel &&
+      a.occupancyCount === b.occupancyCount &&
+      a.occupancyCapacity === b.occupancyCapacity &&
+      a.occupancyPercent === b.occupancyPercent
+    );
   }
 
   private areEqualSets(a: Set<string>, b: Set<string>): boolean {
@@ -1475,6 +1695,10 @@ export class Game {
         );
       }
 
+      return;
+    }
+
+    if (this.selectedTool === null) {
       return;
     }
 
