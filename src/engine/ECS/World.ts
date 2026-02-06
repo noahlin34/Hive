@@ -985,7 +985,9 @@ export class AgentSystem {
         continue;
       }
 
-      if (agent.phase !== 'RIDING') {
+      const isGroundExitEgressPhase = this.isGroundExitEgressPhase(agent);
+
+      if (agent.phase !== 'RIDING' && !isGroundExitEgressPhase) {
         const standingFloorY = Math.round(position.y);
         if (!this.hasFloorAt(Math.round(position.x), standingFloorY)) {
           this.world.destroyEntity(entityId);
@@ -1068,7 +1070,7 @@ export class AgentSystem {
 
         const step = moveTowards(position.x, agent.targetX, agent.speed * deltaSeconds);
 
-        if (!this.hasFloorAt(Math.round(step.value), agent.targetY)) {
+        if (!isGroundExitEgressPhase && !this.hasFloorAt(Math.round(step.value), agent.targetY)) {
           this.world.destroyEntity(entityId);
           continue;
         }
@@ -1093,6 +1095,14 @@ export class AgentSystem {
         this.coolStress(agent, deltaSeconds);
       }
     }
+  }
+
+  private isGroundExitEgressPhase(agent: Agent): boolean {
+    return (
+      agent.despawnOnArrival &&
+      agent.targetY === this.groundRow &&
+      (agent.phase === 'WALK_TO_TARGET' || agent.phase === 'AT_TARGET')
+    );
   }
 
   private coolStress(agent: Agent, deltaSeconds: number): void {
@@ -1632,6 +1642,9 @@ export class ElevatorSystem {
 
   private unloadAtFloor(carEntity: EntityId, column: number, floor: number): void {
     const car = this.world.getComponent(carEntity, 'elevatorCar');
+    if (!car) {
+      return;
+    }
 
     for (const agentEntity of this.world.query('position', 'agent')) {
       const agent = this.world.getComponent(agentEntity, 'agent');
@@ -1649,7 +1662,15 @@ export class ElevatorSystem {
         continue;
       }
 
-      position.x = column;
+      const exitX = this.resolveWaitXForShaft(column, floor, agent.targetX);
+      if (exitX === null) {
+        // No walkable tile adjacent to the shaft on this floor, so keep the
+        // rider in the car and retry when service changes.
+        this.addStop(car, floor);
+        continue;
+      }
+
+      position.x = exitX;
       position.y = floor;
       agent.phase = 'WALK_TO_TARGET';
       agent.sourceFloorY = floor;
@@ -1659,9 +1680,7 @@ export class ElevatorSystem {
       agent.callRegistered = false;
       agent.waitMs = 0;
 
-      if (car) {
-        car.occupants = car.occupants.filter((occupantId) => occupantId !== agentEntity);
-      }
+      car.occupants = car.occupants.filter((occupantId) => occupantId !== agentEntity);
     }
   }
 

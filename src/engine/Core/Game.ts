@@ -451,12 +451,10 @@ export class Game {
 
       if (agent.archetype === 'VISITOR') {
         if (agent.leaveByMinute !== null && totalMinute >= agent.leaveByMinute) {
-          const lobby = this.findNearestCell(lobbies, position.x);
-          if (lobby) {
-            const leaving = this.agentSystem.issueTrip(agentEntity, lobby, true);
-            if (leaving) {
-              agent.routine = 'LEAVING';
-            }
+          const exitTarget = this.getOffscreenExitTarget(position.x);
+          const leaving = this.agentSystem.issueTrip(agentEntity, exitTarget, true);
+          if (leaving) {
+            agent.routine = 'LEAVING';
           }
           continue;
         }
@@ -554,8 +552,8 @@ export class Game {
 
       if (agent.archetype === 'OFFICE_WORKER') {
         if (minuteOfDay >= EVENING_MINUTE || minuteOfDay < MORNING_MINUTE) {
-          const lobby = this.findNearestCell(lobbies, position.x);
-          if (lobby && this.agentSystem.issueTrip(agentEntity, lobby, true)) {
+          const exitTarget = this.getOffscreenExitTarget(position.x);
+          if (this.agentSystem.issueTrip(agentEntity, exitTarget, true)) {
             agent.routine = 'LEAVING';
           }
           continue;
@@ -701,8 +699,6 @@ export class Game {
   }
 
   private endOfficeDay(): void {
-    const lobbies = this.getFloorCellsByZone('LOBBY');
-
     for (const workerEntity of this.world.query('agent', 'position')) {
       const agent = this.world.getComponent(workerEntity, 'agent');
       const position = this.world.getComponent(workerEntity, 'position');
@@ -722,12 +718,8 @@ export class Game {
         continue;
       }
 
-      const lobby = this.findNearestCell(lobbies, position.x);
-      if (!lobby) {
-        continue;
-      }
-
-      const success = this.agentSystem.issueTrip(workerEntity, lobby, true);
+      const exitTarget = this.getOffscreenExitTarget(position.x);
+      const success = this.agentSystem.issueTrip(workerEntity, exitTarget, true);
       if (!success) {
         continue;
       }
@@ -977,6 +969,17 @@ export class Game {
     }
 
     return best;
+  }
+
+  private getOffscreenExitTarget(fromX: number): GridCell {
+    const center = GRID_COLUMNS * 0.5;
+    const useLeftExit =
+      fromX < center || (Math.abs(fromX - center) < 0.01 && Math.random() < 0.5);
+
+    return {
+      x: useLeftExit ? -2 : GRID_COLUMNS + 2,
+      y: GROUND_ROW,
+    };
   }
 
   private getAgentsByArchetype(archetype: AgentArchetype): EntityId[] {
