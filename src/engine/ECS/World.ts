@@ -192,6 +192,7 @@ const STRESS_GAIN_PER_SECOND = 6;
 const STRESS_DECAY_PER_SECOND = 2.2;
 
 const DISPATCH_DIRECTION_PENALTY = 8;
+const AGENT_SPRITE_PATH = '/agent.png';
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -320,10 +321,13 @@ export class ECSWorld {
 export class RenderSystem {
   private readonly world: ECSWorld;
   private readonly projector: GridProjector;
+  private agentSprite: HTMLCanvasElement | null = null;
+  private agentSpriteLoaded = false;
 
   public constructor(world: ECSWorld, projector: GridProjector) {
     this.world = world;
     this.projector = projector;
+    this.loadAgentSprite(AGENT_SPRITE_PATH);
   }
 
   public render(ctx: CanvasRenderingContext2D): void {
@@ -414,30 +418,21 @@ export class RenderSystem {
       const offset = (this.projector.cellSize - size) * 0.5;
       const drawX = pixelX + offset;
       const drawY = pixelY + offset;
-
-      if (renderable.shape === 'circle') {
-        const radius = size * 0.5;
-        ctx.fillStyle = renderable.color;
-        ctx.beginPath();
-        ctx.arc(drawX + radius, drawY + radius, radius, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        ctx.fillStyle = renderable.color;
-        ctx.fillRect(drawX, drawY, size, size);
-      }
-
       const agent = this.world.getComponent(entityId, 'agent');
-      if (agent) {
-        const moodOutline =
-          agent.mood === 'happy'
-            ? '#22c55e'
-            : agent.mood === 'angry'
-              ? '#ef4444'
-              : '#facc15';
 
-        ctx.strokeStyle = moodOutline;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(drawX + 1, drawY + 1, size - 2, size - 2);
+      if (agent && this.agentSpriteLoaded && this.agentSprite) {
+        ctx.drawImage(this.agentSprite, drawX, drawY, size, size);
+      } else {
+        if (renderable.shape === 'circle') {
+          const radius = size * 0.5;
+          ctx.fillStyle = renderable.color;
+          ctx.beginPath();
+          ctx.arc(drawX + radius, drawY + radius, radius, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = renderable.color;
+          ctx.fillRect(drawX, drawY, size, size);
+        }
       }
 
       const elevatorCar = this.world.getComponent(entityId, 'elevatorCar');
@@ -452,6 +447,76 @@ export class RenderSystem {
         ctx.strokeRect(drawX + 2, drawY + 2, size - 4, size - 4);
       }
     }
+  }
+
+  private loadAgentSprite(path: string): void {
+    const image = new Image();
+    image.onload = () => {
+      this.agentSprite = this.chromaKeySprite(image);
+      this.agentSpriteLoaded = this.agentSprite !== null;
+    };
+    image.onerror = () => {
+      this.agentSprite = null;
+      this.agentSpriteLoaded = false;
+    };
+    image.src = path;
+  }
+
+  private chromaKeySprite(image: HTMLImageElement): HTMLCanvasElement | null {
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+
+    if (canvas.width === 0 || canvas.height === 0) {
+      return null;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.drawImage(image, 0, 0);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const pixels = imageData.data;
+
+    for (let index = 0; index < pixels.length; index += 4) {
+      const r = pixels[index];
+      const g = pixels[index + 1];
+      const b = pixels[index + 2];
+      const a = pixels[index + 3];
+      const maxOther = Math.max(r, b);
+      const greenDominance = g - maxOther;
+
+      // Treat strongly green-dominant pixels as key candidates.
+      if (g < 72 || greenDominance < 18) {
+        continue;
+      }
+
+      // Hard-kill near pure greens.
+      if (g >= 190 && r <= 110 && b <= 110 && greenDominance >= 70) {
+        pixels[index + 3] = 0;
+        continue;
+      }
+
+      // Soft key + despill for edge pixels to prevent green fringe.
+      const dominanceStrength = clamp((greenDominance - 18) / 78, 0, 1);
+      const greenStrength = clamp((g - 72) / 160, 0, 1);
+      const keyStrength = dominanceStrength * greenStrength;
+
+      if (keyStrength <= 0) {
+        continue;
+      }
+
+      const nextAlpha = Math.round(a * (1 - keyStrength));
+      pixels[index + 3] = nextAlpha < 10 ? 0 : nextAlpha;
+
+      const despill = keyStrength * 0.78;
+      pixels[index + 1] = Math.round(g - (g - maxOther) * despill);
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+    return canvas;
   }
 
   private renderCondoWarnings(ctx: CanvasRenderingContext2D): void {
