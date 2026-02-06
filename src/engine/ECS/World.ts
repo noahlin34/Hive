@@ -20,6 +20,17 @@ export interface Renderable {
 }
 
 export type AgentMood = 'happy' | 'neutral' | 'angry';
+export type AgentArchetype = 'VISITOR' | 'RESIDENT' | 'OFFICE_WORKER';
+export type AgentRoutine =
+  | 'VISITING'
+  | 'SHOPPING'
+  | 'LEAVING'
+  | 'HOME'
+  | 'WANDERING'
+  | 'COMMUTING_TO_WORK'
+  | 'WORKING'
+  | 'LUNCH_BREAK'
+  | 'COMMUTING_HOME';
 
 export type AgentPhase =
   | 'IDLE'
@@ -33,15 +44,24 @@ export type TravelDirection = 'UP' | 'DOWN' | 'NONE';
 
 export interface Agent {
   name: string;
+  archetype: AgentArchetype;
+  routine: AgentRoutine;
   mood: AgentMood;
   speed: number;
   phase: AgentPhase;
   stress: number;
   waitMs: number;
+  nextActionMinute: number;
+  leaveByMinute: number | null;
+  hasLunchedToday: boolean;
   sourceFloorY: number | null;
   targetFloorY: number | null;
   targetX: number;
   targetY: number;
+  homeX: number | null;
+  homeY: number | null;
+  workX: number | null;
+  workY: number | null;
   desiredDirection: TravelDirection;
   assignedShaftX: number | null;
   waitX: number | null;
@@ -91,6 +111,8 @@ export interface ElevatorCar {
   bankId: number;
   stopQueue: number[];
   phaseTimerMs: number;
+  capacity: number;
+  occupants: EntityId[];
 }
 
 export interface Influence {
@@ -1008,7 +1030,11 @@ export class AgentSystem {
           position.y = sourceFloor;
         }
 
-        if (waitX !== null) {
+        if (
+          waitX !== null &&
+          sourceFloor !== null &&
+          !this.hasFloorAt(Math.round(position.x), sourceFloor)
+        ) {
           position.x = waitX;
         }
 
@@ -1186,6 +1212,7 @@ export class ElevatorSystem {
 
     this.syncCars(floorsByColumn, bankByColumn);
     this.dispatchCalls(floorsByColumn, banks);
+    this.arrangeQueueLines();
     this.updateCars(deltaMs, floorsByColumn);
     this.syncRiders();
   }
@@ -1298,6 +1325,8 @@ export class ElevatorSystem {
         bankId: bank.id,
         stopQueue: [],
         phaseTimerMs: 0,
+        capacity: 4,
+        occupants: [],
       });
     }
 
@@ -1385,6 +1414,7 @@ export class ElevatorSystem {
         const score =
           Math.abs(carPosition.y - sourceFloor) +
           directionPenalty +
+          car.occupants.length * 2 +
           car.stopQueue.length * 1.4 +
           Math.abs(car.column - shaftX) * 0.8;
 
@@ -1532,7 +1562,77 @@ export class ElevatorSystem {
     }
   }
 
+  private arrangeQueueLines(): void {
+    type QueueGroup = {
+      floorY: number;
+      shaftX: number;
+      sideX: number;
+      agents: EntityId[];
+    };
+
+    const groups = new Map<string, QueueGroup>();
+
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      if (!agent || agent.phase !== 'WAIT_AT_SHAFT') {
+        continue;
+      }
+
+      const floorY = agent.sourceFloorY;
+      const shaftX = agent.assignedShaftX;
+      const sideX = agent.waitX;
+
+      if (floorY === null || shaftX === null || sideX === null) {
+        continue;
+      }
+
+      const key = `${floorY}:${shaftX}:${sideX}`;
+      const group = groups.get(key) ?? {
+        floorY,
+        shaftX,
+        sideX,
+        agents: [],
+      };
+
+      group.agents.push(agentEntity);
+      groups.set(key, group);
+    }
+
+    for (const group of groups.values()) {
+      const direction = group.sideX < group.shaftX ? -1 : 1;
+
+      group.agents.sort((a, b) => {
+        const aAgent = this.world.getComponent(a, 'agent');
+        const bAgent = this.world.getComponent(b, 'agent');
+
+        if (!aAgent || !bAgent) {
+          return 0;
+        }
+
+        return bAgent.waitMs - aAgent.waitMs;
+      });
+
+      for (let index = 0; index < group.agents.length; index += 1) {
+        const agentEntity = group.agents[index];
+        const position = this.world.getComponent(agentEntity, 'position');
+        if (!position) {
+          continue;
+        }
+
+        const candidateX = group.sideX + direction * index;
+        const assignedX = this.hasFloorAt(candidateX, group.floorY)
+          ? candidateX
+          : group.sideX;
+
+        position.x = assignedX;
+        position.y = group.floorY;
+      }
+    }
+  }
+
   private unloadAtFloor(carEntity: EntityId, column: number, floor: number): void {
+    const car = this.world.getComponent(carEntity, 'elevatorCar');
+
     for (const agentEntity of this.world.query('position', 'agent')) {
       const agent = this.world.getComponent(agentEntity, 'agent');
       const position = this.world.getComponent(agentEntity, 'position');
@@ -1558,15 +1658,24 @@ export class ElevatorSystem {
       agent.waitX = null;
       agent.callRegistered = false;
       agent.waitMs = 0;
+
+      if (car) {
+        car.occupants = car.occupants.filter((occupantId) => occupantId !== agentEntity);
+      }
     }
   }
 
   private loadAtFloor(carEntity: EntityId, column: number, floor: number): void {
+    const car = this.world.getComponent(carEntity, 'elevatorCar');
+    if (!car) {
+      return;
+    }
+
+    const waitingAgents: EntityId[] = [];
+
     for (const agentEntity of this.world.query('position', 'agent')) {
       const agent = this.world.getComponent(agentEntity, 'agent');
-      const position = this.world.getComponent(agentEntity, 'position');
-
-      if (!agent || !position || agent.phase !== 'WAIT_AT_SHAFT') {
+      if (!agent || agent.phase !== 'WAIT_AT_SHAFT') {
         continue;
       }
 
@@ -1578,10 +1687,57 @@ export class ElevatorSystem {
         continue;
       }
 
+      waitingAgents.push(agentEntity);
+    }
+
+    waitingAgents.sort((a, b) => {
+      const aAgent = this.world.getComponent(a, 'agent');
+      const bAgent = this.world.getComponent(b, 'agent');
+
+      if (!aAgent || !bAgent) {
+        return 0;
+      }
+
+      return bAgent.waitMs - aAgent.waitMs;
+    });
+
+    const remainingCapacity = Math.max(0, car.capacity - car.occupants.length);
+    const boardingAgents = waitingAgents.slice(0, remainingCapacity);
+    const overflowAgents = waitingAgents.slice(remainingCapacity);
+
+    for (const agentEntity of boardingAgents) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      const position = this.world.getComponent(agentEntity, 'position');
+
+      if (!agent || !position) {
+        continue;
+      }
+
       agent.phase = 'RIDING';
       agent.waitMs = 0;
       position.x = column;
       position.y = floor;
+
+      if (!car.occupants.includes(agentEntity)) {
+        car.occupants.push(agentEntity);
+      }
+
+      const targetFloor = agent.targetFloorY;
+      if (targetFloor !== null) {
+        this.addStop(car, targetFloor);
+      }
+    }
+
+    for (const agentEntity of overflowAgents) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      if (!agent) {
+        continue;
+      }
+
+      // Keep the queue physically in place, but release the dispatch lock
+      // so another car (or the same car on a later cycle) can pick up.
+      agent.assignedCarId = null;
+      agent.callRegistered = false;
     }
   }
 

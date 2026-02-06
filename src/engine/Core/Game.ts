@@ -1,6 +1,7 @@
 import {
   AgentSystem,
   type Agent,
+  type AgentArchetype,
   type EntityId,
   ECSWorld,
   ElevatorSystem,
@@ -8,7 +9,6 @@ import {
   MouseSystem,
   RenderSystem,
   type RoomZone,
-  type Schedule,
   ZoningSystem,
 } from '../ECS/World';
 import { GameLoop } from './Loop';
@@ -20,7 +20,7 @@ const GRID_COLUMNS = 30;
 const GRID_ROWS = 20;
 const GROUND_ROW = GRID_ROWS - 2;
 
-const STARTING_FUNDS = 50000;
+const STARTING_FUNDS = 100000;
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -31,7 +31,8 @@ const LUNCH_MINUTE = 12 * 60;
 const EVENING_MINUTE = 17 * 60;
 
 const DEFAULT_LOBBY_X = 2;
-const MORNING_WORKER_COUNT = 5;
+const MORNING_WORKER_COUNT = 6;
+const RESIDENT_WORKER_SHARE = 0.45;
 
 type StoreListener = () => void;
 
@@ -341,92 +342,263 @@ export class Game {
   private processMinute(totalMinute: number): void {
     const minuteOfDay = this.toMinuteOfDay(totalMinute);
 
-    this.updateWorkerSchedules(totalMinute);
+    this.spawnAutonomousTraffic(totalMinute, minuteOfDay);
+    this.updateAutonomousRoutines(totalMinute, minuteOfDay);
 
     if (minuteOfDay === MORNING_MINUTE) {
-      this.spawnMorningWorkers();
+      this.startOfficeDay(totalMinute);
       return;
     }
 
     if (minuteOfDay === LUNCH_MINUTE) {
-      this.sendWorkersToLunch(totalMinute);
+      this.startLunchBreak(totalMinute);
       return;
     }
 
     if (minuteOfDay === EVENING_MINUTE) {
-      this.sendWorkersHome();
+      this.endOfficeDay();
       return;
     }
 
     if (minuteOfDay === 0) {
+      this.resetDailyFlags();
       this.collectRentAtMidnight();
     }
   }
 
-  private updateWorkerSchedules(totalMinute: number): void {
-    const workers = this.world.query('agent', 'schedule', 'position');
+  private spawnAutonomousTraffic(totalMinute: number, minuteOfDay: number): void {
+    const offices = this.getFloorCellsByZone('OFFICE');
+    const condos = this.getFloorCellsByZone('CONDO');
+    const foodCourts = this.getFloorCellsByZone('FOOD_COURT');
+    const lobbies = this.getFloorCellsByZone('LOBBY');
 
-    for (const workerEntity of workers) {
-      const schedule = this.world.getComponent(workerEntity, 'schedule');
-      const agent = this.world.getComponent(workerEntity, 'agent');
-      const position = this.world.getComponent(workerEntity, 'position');
+    if (lobbies.length === 0) {
+      return;
+    }
 
-      if (!schedule || !agent || !position) {
-        continue;
+    const attractionScore =
+      offices.length * 1.3 +
+      condos.length * 1.1 +
+      foodCourts.length * 2.1 +
+      lobbies.length * 0.25;
+
+    const visitors = this.getAgentsByArchetype('VISITOR').length;
+    const visitorCap = Math.max(4, Math.min(24, Math.floor(2 + attractionScore * 0.32)));
+    const visitorSpawnInterval = Math.max(6, 22 - Math.min(14, Math.floor(attractionScore / 2.5)));
+
+    if (
+      minuteOfDay >= 6 * 60 &&
+      minuteOfDay < 22 * 60 &&
+      visitors < visitorCap &&
+      totalMinute % visitorSpawnInterval === 0
+    ) {
+      const spawnChance = Math.min(0.9, 0.16 + attractionScore * 0.01);
+      if (Math.random() < spawnChance) {
+        const lobby = lobbies[Math.floor(Math.random() * lobbies.length)];
+        this.spawnVisitor(lobby.x, totalMinute);
       }
+    }
 
-      if (schedule.stage === 'COMMUTE_TO_OFFICE' && agent.phase === 'AT_TARGET') {
-        schedule.stage = 'AT_OFFICE';
-        continue;
-      }
-
-      if (schedule.stage === 'TO_LUNCH' && agent.phase === 'AT_TARGET') {
-        schedule.stage = 'AT_LUNCH';
-        schedule.lunchReleaseMinute = totalMinute + 30;
-        continue;
-      }
+    if (condos.length > 0) {
+      const residents = this.getAgentsByArchetype('RESIDENT');
+      const residentTarget = Math.min(condos.length, Math.max(1, Math.floor(condos.length * 0.78)));
+      const residentSpawnInterval = 60;
 
       if (
-        schedule.stage === 'AT_LUNCH' &&
-        schedule.lunchReleaseMinute !== null &&
-        totalMinute >= schedule.lunchReleaseMinute
+        residents.length < residentTarget &&
+        totalMinute % residentSpawnInterval === 0 &&
+        Math.random() < 0.65
       ) {
-        const success = this.agentSystem.issueTrip(
-          workerEntity,
-          { x: schedule.officeX, y: schedule.officeY },
-          false,
+        const occupiedHomes = new Set(
+          residents
+            .map((residentId) => this.world.getComponent(residentId, 'agent'))
+            .filter((agent): agent is Agent => Boolean(agent && agent.homeX !== null && agent.homeY !== null))
+            .map((agent) => `${agent.homeX},${agent.homeY}`),
         );
 
-        if (success) {
-          schedule.stage = 'RETURN_TO_OFFICE';
-          schedule.lunchReleaseMinute = null;
-        }
+        const availableHomes = condos.filter((cell) => !occupiedHomes.has(`${cell.x},${cell.y}`));
+        const home = this.pickRandomCell(availableHomes);
 
-        continue;
-      }
-
-      if (schedule.stage === 'RETURN_TO_OFFICE' && agent.phase === 'AT_TARGET') {
-        schedule.stage = 'AT_OFFICE';
-        continue;
-      }
-
-      if (schedule.stage === 'TO_HOME' && agent.phase === 'IDLE') {
-        const lobbyTarget = this.findNearestCell(this.getFloorCellsByZone('LOBBY'), position.x);
-
-        const success = this.agentSystem.issueTrip(
-          workerEntity,
-          lobbyTarget ?? { x: schedule.homeX, y: GROUND_ROW },
-          true,
-        );
-
-        if (!success) {
-          agent.phase = 'IDLE';
+        if (home) {
+          this.spawnResident(home, totalMinute);
         }
       }
     }
   }
 
-  private spawnMorningWorkers(): void {
+  private updateAutonomousRoutines(totalMinute: number, minuteOfDay: number): void {
+    const foodCourts = this.getFloorCellsByZone('FOOD_COURT');
+    const offices = this.getFloorCellsByZone('OFFICE');
+    const lobbies = this.getFloorCellsByZone('LOBBY');
+
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const position = this.world.getComponent(agentEntity, 'position');
+      const agent = this.world.getComponent(agentEntity, 'agent');
+
+      if (!position || !agent) {
+        continue;
+      }
+
+      if (agent.phase !== 'AT_TARGET' && agent.phase !== 'IDLE') {
+        continue;
+      }
+
+      const standingZone = this.getZoneAt(Math.round(position.x), Math.round(position.y));
+      if (standingZone === 'FOOD_COURT' && totalMinute >= agent.nextActionMinute) {
+        this.addShopRevenue(8 + Math.floor(Math.random() * 28), position.x, position.y);
+        agent.nextActionMinute = totalMinute + 10 + Math.floor(Math.random() * 20);
+      }
+
+      if (agent.archetype === 'VISITOR') {
+        if (agent.leaveByMinute !== null && totalMinute >= agent.leaveByMinute) {
+          const lobby = this.findNearestCell(lobbies, position.x);
+          if (lobby) {
+            const leaving = this.agentSystem.issueTrip(agentEntity, lobby, true);
+            if (leaving) {
+              agent.routine = 'LEAVING';
+            }
+          }
+          continue;
+        }
+
+        if (totalMinute < agent.nextActionMinute) {
+          continue;
+        }
+
+        const target = this.pickExplorationTarget(position.x);
+        if (!target) {
+          continue;
+        }
+
+        const moving = this.agentSystem.issueTrip(agentEntity, target, false);
+        if (moving) {
+          agent.routine = target.y === GROUND_ROW ? 'VISITING' : 'SHOPPING';
+          agent.nextActionMinute = totalMinute + 10 + Math.floor(Math.random() * 30);
+        }
+
+        continue;
+      }
+
+      if (agent.archetype === 'RESIDENT') {
+        const isNight = minuteOfDay >= 21 * 60 || minuteOfDay < 6 * 60;
+
+        if (isNight && agent.homeX !== null && agent.homeY !== null) {
+          if (Math.round(position.x) !== agent.homeX || Math.round(position.y) !== agent.homeY) {
+            const returning = this.agentSystem.issueTrip(
+              agentEntity,
+              { x: agent.homeX, y: agent.homeY },
+              false,
+            );
+            if (returning) {
+              agent.routine = 'COMMUTING_HOME';
+            }
+          } else {
+            agent.routine = 'HOME';
+          }
+          continue;
+        }
+
+        if (
+          agent.workX !== null &&
+          agent.workY !== null &&
+          minuteOfDay >= MORNING_MINUTE &&
+          minuteOfDay < EVENING_MINUTE
+        ) {
+          if (agent.hasLunchedToday && minuteOfDay < LUNCH_MINUTE + 90) {
+            continue;
+          }
+
+          if (minuteOfDay >= LUNCH_MINUTE && !agent.hasLunchedToday) {
+            const lunchTarget =
+              this.findNearestCell(foodCourts, position.x) ?? this.findNearestCell(lobbies, position.x);
+            if (lunchTarget && this.agentSystem.issueTrip(agentEntity, lunchTarget, false)) {
+              agent.routine = 'LUNCH_BREAK';
+              agent.hasLunchedToday = true;
+              agent.nextActionMinute = totalMinute + 30;
+              continue;
+            }
+          }
+
+          if (agent.routine === 'LUNCH_BREAK' && totalMinute >= agent.nextActionMinute) {
+            if (this.agentSystem.issueTrip(agentEntity, { x: agent.workX, y: agent.workY }, false)) {
+              agent.routine = 'COMMUTING_TO_WORK';
+            }
+            continue;
+          }
+
+          if (Math.round(position.x) !== agent.workX || Math.round(position.y) !== agent.workY) {
+            if (this.agentSystem.issueTrip(agentEntity, { x: agent.workX, y: agent.workY }, false)) {
+              agent.routine = 'COMMUTING_TO_WORK';
+            }
+            continue;
+          }
+
+          agent.routine = 'WORKING';
+          continue;
+        }
+
+        if (totalMinute >= agent.nextActionMinute) {
+          const wanderTarget =
+            this.findNearestCell(foodCourts, position.x) ??
+            this.findNearestCell(offices, position.x) ??
+            this.findNearestCell(lobbies, position.x);
+
+          if (wanderTarget && this.agentSystem.issueTrip(agentEntity, wanderTarget, false)) {
+            agent.routine = 'WANDERING';
+            agent.nextActionMinute = totalMinute + 20 + Math.floor(Math.random() * 25);
+          }
+        }
+
+        continue;
+      }
+
+      if (agent.archetype === 'OFFICE_WORKER') {
+        if (minuteOfDay >= EVENING_MINUTE || minuteOfDay < MORNING_MINUTE) {
+          const lobby = this.findNearestCell(lobbies, position.x);
+          if (lobby && this.agentSystem.issueTrip(agentEntity, lobby, true)) {
+            agent.routine = 'LEAVING';
+          }
+          continue;
+        }
+
+        if (minuteOfDay >= LUNCH_MINUTE && !agent.hasLunchedToday) {
+          const lunchTarget =
+            this.findNearestCell(foodCourts, position.x) ?? this.findNearestCell(lobbies, position.x);
+
+          if (lunchTarget && this.agentSystem.issueTrip(agentEntity, lunchTarget, false)) {
+            agent.routine = 'LUNCH_BREAK';
+            agent.hasLunchedToday = true;
+            agent.nextActionMinute = totalMinute + 30;
+            continue;
+          }
+        }
+
+        if (
+          agent.routine === 'LUNCH_BREAK' &&
+          totalMinute >= agent.nextActionMinute &&
+          agent.workX !== null &&
+          agent.workY !== null
+        ) {
+          if (this.agentSystem.issueTrip(agentEntity, { x: agent.workX, y: agent.workY }, false)) {
+            agent.routine = 'COMMUTING_TO_WORK';
+          }
+          continue;
+        }
+
+        if (agent.workX !== null && agent.workY !== null) {
+          if (Math.round(position.x) !== agent.workX || Math.round(position.y) !== agent.workY) {
+            if (this.agentSystem.issueTrip(agentEntity, { x: agent.workX, y: agent.workY }, false)) {
+              agent.routine = 'COMMUTING_TO_WORK';
+            }
+          } else {
+            agent.routine = 'WORKING';
+          }
+        }
+      }
+    }
+  }
+
+  private startOfficeDay(totalMinute: number): void {
     const offices = this.getFloorCellsByZone('OFFICE');
     const lobbies = this.getFloorCellsByZone('LOBBY');
 
@@ -434,24 +606,78 @@ export class Game {
       return;
     }
 
-    for (let index = 0; index < MORNING_WORKER_COUNT; index += 1) {
-      const spawnLobby = lobbies[Math.floor(Math.random() * lobbies.length)];
-      const office = offices[Math.floor(Math.random() * offices.length)];
+    const residents = this.getAgentsByArchetype('RESIDENT');
+    const residentWorkerBudget = Math.min(
+      offices.length,
+      Math.floor(offices.length * RESIDENT_WORKER_SHARE),
+    );
 
-      const worker = this.spawnOfficeWorker(spawnLobby.x, office);
+    const shuffledOffices = [...offices].sort(() => Math.random() - 0.5);
+    let assignedResidentWorkers = 0;
+
+    for (const residentId of residents) {
+      if (assignedResidentWorkers >= residentWorkerBudget || shuffledOffices.length === 0) {
+        break;
+      }
+
+      const resident = this.world.getComponent(residentId, 'agent');
+      const residentPos = this.world.getComponent(residentId, 'position');
+      if (!resident || !residentPos) {
+        continue;
+      }
+
+      const office = shuffledOffices.pop();
+      if (!office) {
+        continue;
+      }
+
+      resident.workX = office.x;
+      resident.workY = office.y;
+      resident.hasLunchedToday = false;
+
+      if (this.agentSystem.issueTrip(residentId, office, false)) {
+        resident.routine = 'COMMUTING_TO_WORK';
+        assignedResidentWorkers += 1;
+      }
+    }
+
+    const targetExternalWorkers = Math.min(
+      offices.length,
+      MORNING_WORKER_COUNT + Math.floor(offices.length * 0.3),
+    );
+
+    for (let index = 0; index < targetExternalWorkers && shuffledOffices.length > 0; index += 1) {
+      const spawnLobby = lobbies[Math.floor(Math.random() * lobbies.length)];
+      const office = shuffledOffices.pop();
+      if (!office) {
+        continue;
+      }
+
+      const worker = this.spawnOfficeWorker(spawnLobby.x, office, totalMinute);
       this.agentSystem.issueTrip(worker, office, false);
     }
   }
 
-  private sendWorkersToLunch(totalMinute: number): void {
+  private startLunchBreak(totalMinute: number): void {
     const foodCourts = this.getFloorCellsByZone('FOOD_COURT');
     const lobbies = this.getFloorCellsByZone('LOBBY');
 
-    for (const workerEntity of this.world.query('agent', 'schedule', 'position')) {
-      const schedule = this.world.getComponent(workerEntity, 'schedule');
+    for (const workerEntity of this.world.query('agent', 'position')) {
+      const agent = this.world.getComponent(workerEntity, 'agent');
       const position = this.world.getComponent(workerEntity, 'position');
 
-      if (!schedule || !position || schedule.stage === 'TO_HOME') {
+      if (!agent || !position) {
+        continue;
+      }
+
+      const isWorkingResident =
+        agent.archetype === 'RESIDENT' &&
+        agent.workX !== null &&
+        agent.workY !== null &&
+        agent.routine === 'WORKING';
+      const isOfficeWorker = agent.archetype === 'OFFICE_WORKER' && agent.routine === 'WORKING';
+
+      if ((!isWorkingResident && !isOfficeWorker) || agent.hasLunchedToday) {
         continue;
       }
 
@@ -468,34 +694,56 @@ export class Game {
         continue;
       }
 
-      schedule.stage = 'TO_LUNCH';
-      schedule.lunchReleaseMinute = totalMinute + 30;
+      agent.routine = 'LUNCH_BREAK';
+      agent.hasLunchedToday = true;
+      agent.nextActionMinute = totalMinute + 30;
     }
   }
 
-  private sendWorkersHome(): void {
+  private endOfficeDay(): void {
     const lobbies = this.getFloorCellsByZone('LOBBY');
 
-    for (const workerEntity of this.world.query('agent', 'schedule', 'position')) {
-      const schedule = this.world.getComponent(workerEntity, 'schedule');
+    for (const workerEntity of this.world.query('agent', 'position')) {
+      const agent = this.world.getComponent(workerEntity, 'agent');
       const position = this.world.getComponent(workerEntity, 'position');
 
-      if (!schedule || !position) {
+      if (!agent || !position) {
         continue;
       }
 
-      const lobby = this.findNearestCell(lobbies, position.x) ?? {
-        x: schedule.homeX,
-        y: GROUND_ROW,
-      };
+      if (agent.archetype === 'RESIDENT' && agent.homeX !== null && agent.homeY !== null) {
+        if (this.agentSystem.issueTrip(workerEntity, { x: agent.homeX, y: agent.homeY }, false)) {
+          agent.routine = 'COMMUTING_HOME';
+        }
+        continue;
+      }
+
+      if (agent.archetype !== 'OFFICE_WORKER') {
+        continue;
+      }
+
+      const lobby = this.findNearestCell(lobbies, position.x);
+      if (!lobby) {
+        continue;
+      }
 
       const success = this.agentSystem.issueTrip(workerEntity, lobby, true);
       if (!success) {
         continue;
       }
 
-      schedule.stage = 'TO_HOME';
-      schedule.lunchReleaseMinute = null;
+      agent.routine = 'LEAVING';
+    }
+  }
+
+  private resetDailyFlags(): void {
+    for (const agentEntity of this.world.query('agent')) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      if (!agent) {
+        continue;
+      }
+
+      agent.hasLunchedToday = false;
     }
   }
 
@@ -532,7 +780,99 @@ export class Game {
     });
   }
 
-  private spawnOfficeWorker(homeX: number, officeDesk: GridCell): EntityId {
+  private spawnVisitor(spawnX: number, totalMinute: number): EntityId {
+    const visitor = this.world.createEntity();
+
+    this.world.addComponent(visitor, 'position', {
+      x: spawnX,
+      y: GROUND_ROW,
+    });
+
+    this.world.addComponent(visitor, 'renderable', {
+      color: '#ef4444',
+      shape: 'square',
+      sizeScale: 0.66,
+    });
+
+    this.world.addComponent(visitor, 'agent', {
+      name: `Visitor ${this.nextAgentId}`,
+      archetype: 'VISITOR',
+      routine: 'VISITING',
+      mood: 'neutral',
+      speed: 3.1,
+      phase: 'IDLE',
+      stress: 0,
+      waitMs: 0,
+      nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 20),
+      leaveByMinute: totalMinute + 60 + Math.floor(Math.random() * 180),
+      hasLunchedToday: false,
+      sourceFloorY: GROUND_ROW,
+      targetFloorY: GROUND_ROW,
+      targetX: spawnX,
+      targetY: GROUND_ROW,
+      homeX: null,
+      homeY: null,
+      workX: null,
+      workY: null,
+      desiredDirection: 'NONE',
+      assignedShaftX: null,
+      waitX: null,
+      assignedCarId: null,
+      callRegistered: false,
+      despawnOnArrival: false,
+    });
+
+    this.nextAgentId += 1;
+    return visitor;
+  }
+
+  private spawnResident(home: GridCell, totalMinute: number): EntityId {
+    const resident = this.world.createEntity();
+
+    this.world.addComponent(resident, 'position', {
+      x: home.x,
+      y: home.y,
+    });
+
+    this.world.addComponent(resident, 'renderable', {
+      color: '#22c55e',
+      shape: 'square',
+      sizeScale: 0.66,
+    });
+
+    this.world.addComponent(resident, 'agent', {
+      name: `Resident ${this.nextAgentId}`,
+      archetype: 'RESIDENT',
+      routine: 'HOME',
+      mood: 'neutral',
+      speed: 3,
+      phase: 'AT_TARGET',
+      stress: 0,
+      waitMs: 0,
+      nextActionMinute: totalMinute + 15 + Math.floor(Math.random() * 35),
+      leaveByMinute: null,
+      hasLunchedToday: false,
+      sourceFloorY: home.y,
+      targetFloorY: home.y,
+      targetX: home.x,
+      targetY: home.y,
+      homeX: home.x,
+      homeY: home.y,
+      workX: null,
+      workY: null,
+      desiredDirection: 'NONE',
+      assignedShaftX: null,
+      waitX: null,
+      assignedCarId: null,
+      callRegistered: false,
+      despawnOnArrival: false,
+    });
+
+    this.nextAgentId += 1;
+    return resident;
+  }
+
+  private spawnOfficeWorker(homeX: number, officeDesk: GridCell, totalMinute: number): EntityId {
     const worker = this.world.createEntity();
 
     this.world.addComponent(worker, 'position', {
@@ -548,15 +888,24 @@ export class Game {
 
     this.world.addComponent(worker, 'agent', {
       name: `Worker ${this.nextAgentId}`,
+      archetype: 'OFFICE_WORKER',
+      routine: 'COMMUTING_TO_WORK',
       mood: 'neutral',
       speed: 3.2,
       phase: 'IDLE',
       stress: 0,
       waitMs: 0,
+      nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 12),
+      leaveByMinute: null,
+      hasLunchedToday: false,
       sourceFloorY: GROUND_ROW,
       targetFloorY: GROUND_ROW,
       targetX: homeX,
       targetY: GROUND_ROW,
+      homeX: null,
+      homeY: null,
+      workX: officeDesk.x,
+      workY: officeDesk.y,
       desiredDirection: 'NONE',
       assignedShaftX: null,
       waitX: null,
@@ -564,59 +913,13 @@ export class Game {
       callRegistered: false,
       despawnOnArrival: false,
     });
-
-    const schedule: Schedule = {
-      role: 'OFFICE_WORKER',
-      stage: 'COMMUTE_TO_OFFICE',
-      officeX: officeDesk.x,
-      officeY: officeDesk.y,
-      homeX,
-      lunchReleaseMinute: null,
-    };
-
-    this.world.addComponent(worker, 'schedule', schedule);
 
     this.nextAgentId += 1;
     return worker;
   }
 
   private spawnFreelanceAgent(homeX: number): EntityId {
-    const agentEntity = this.world.createEntity();
-
-    this.world.addComponent(agentEntity, 'position', {
-      x: homeX,
-      y: GROUND_ROW,
-    });
-
-    this.world.addComponent(agentEntity, 'renderable', {
-      color: '#ef4444',
-      shape: 'square',
-      sizeScale: 0.66,
-    });
-
-    const agent: Agent = {
-      name: `Visitor ${this.nextAgentId}`,
-      mood: 'neutral',
-      speed: 3.2,
-      phase: 'IDLE',
-      stress: 0,
-      waitMs: 0,
-      sourceFloorY: GROUND_ROW,
-      targetFloorY: GROUND_ROW,
-      targetX: homeX,
-      targetY: GROUND_ROW,
-      desiredDirection: 'NONE',
-      assignedShaftX: null,
-      waitX: null,
-      assignedCarId: null,
-      callRegistered: false,
-      despawnOnArrival: false,
-    };
-
-    this.world.addComponent(agentEntity, 'agent', agent);
-
-    this.nextAgentId += 1;
-    return agentEntity;
+    return this.spawnVisitor(homeX, this.lastProcessedGameMinute);
   }
 
   private commandAgentToHoveredFloor(): void {
@@ -674,6 +977,110 @@ export class Game {
     }
 
     return best;
+  }
+
+  private getAgentsByArchetype(archetype: AgentArchetype): EntityId[] {
+    const matches: EntityId[] = [];
+
+    for (const entityId of this.world.query('agent')) {
+      const agent = this.world.getComponent(entityId, 'agent');
+      if (!agent || agent.archetype !== archetype) {
+        continue;
+      }
+
+      matches.push(entityId);
+    }
+
+    return matches;
+  }
+
+  private pickRandomCell(cells: GridCell[]): GridCell | null {
+    if (cells.length === 0) {
+      return null;
+    }
+
+    const index = Math.floor(Math.random() * cells.length);
+    return cells[index] ?? null;
+  }
+
+  private pickExplorationTarget(fromX: number): GridCell | null {
+    const lobbies = this.getFloorCellsByZone('LOBBY');
+    const foodCourts = this.getFloorCellsByZone('FOOD_COURT');
+    const offices = this.getFloorCellsByZone('OFFICE');
+    const condos = this.getFloorCellsByZone('CONDO');
+
+    const weighted: Array<{ cell: GridCell; weight: number }> = [];
+
+    for (const cell of foodCourts) {
+      weighted.push({ cell, weight: 4.2 });
+    }
+
+    for (const cell of offices) {
+      weighted.push({ cell, weight: 2.4 });
+    }
+
+    for (const cell of condos) {
+      weighted.push({ cell, weight: 1.2 });
+    }
+
+    for (const cell of lobbies) {
+      weighted.push({ cell, weight: 1 });
+    }
+
+    if (weighted.length === 0) {
+      return null;
+    }
+
+    let weightTotal = 0;
+    for (const entry of weighted) {
+      const distanceFactor = 1 + Math.abs(entry.cell.x - fromX) * 0.25;
+      weightTotal += entry.weight / distanceFactor;
+    }
+
+    if (weightTotal <= 0) {
+      return weighted[0]?.cell ?? null;
+    }
+
+    let roll = Math.random() * weightTotal;
+    for (const entry of weighted) {
+      const distanceFactor = 1 + Math.abs(entry.cell.x - fromX) * 0.25;
+      roll -= entry.weight / distanceFactor;
+      if (roll <= 0) {
+        return entry.cell;
+      }
+    }
+
+    return weighted[weighted.length - 1]?.cell ?? null;
+  }
+
+  private getZoneAt(x: number, y: number): RoomZone | null {
+    for (const floorEntity of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(floorEntity, 'position');
+      const floor = this.world.getComponent(floorEntity, 'floor');
+
+      if (!position || !floor) {
+        continue;
+      }
+
+      if (position.x === x && position.y === y) {
+        return floor.zone;
+      }
+    }
+
+    return null;
+  }
+
+  private addShopRevenue(amount: number, x: number, y: number): void {
+    if (amount <= 0) {
+      return;
+    }
+
+    const funds = gameStateStore.getSnapshot().money;
+    gameStateStore.setState({
+      money: funds + amount,
+    });
+
+    this.spawnFloatingText(x, y - 0.05, `+$${amount}`);
   }
 
   private toMinuteOfDay(totalMinute: number): number {
