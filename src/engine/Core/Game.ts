@@ -21,6 +21,7 @@ const GRID_ROWS = 20;
 const GROUND_ROW = GRID_ROWS - 2;
 
 const STARTING_FUNDS = 100000;
+const OFFICE_TEXTURE_PATH: string | null = '/office.jpg';
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -117,6 +118,9 @@ export class Game {
 
   private selectedTool: Tool = Tool.FLOOR;
   private worldLayerDirty = true;
+  private officeTexture: HTMLImageElement | null = null;
+  private officeTextureLoaded = false;
+  private officeTexturePath: string | null = null;
 
   private lastProcessedGameMinute = 0;
   private lastPublishedGameMinute = -1;
@@ -150,6 +154,8 @@ export class Game {
       this.update(deltaMs, elapsedMs);
       this.renderFrame();
     });
+
+    this.setOfficeTexturePath(OFFICE_TEXTURE_PATH);
   }
 
   public start(): void {
@@ -177,6 +183,46 @@ export class Game {
 
   public setTool(tool: Tool): void {
     this.selectedTool = tool;
+  }
+
+  public setOfficeTexturePath(path: string | null): void {
+    const trimmed = path?.trim() ?? '';
+    if (!trimmed) {
+      this.officeTexturePath = null;
+    } else if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:')
+    ) {
+      this.officeTexturePath = trimmed;
+    } else {
+      this.officeTexturePath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    }
+
+    this.officeTexture = null;
+    this.officeTextureLoaded = false;
+
+    if (!this.officeTexturePath) {
+      this.worldLayerDirty = true;
+      return;
+    }
+
+    const requestedPath = this.officeTexturePath;
+    const image = new Image();
+    image.onload = () => {
+      if (this.officeTexturePath !== requestedPath) {
+        return;
+      }
+      this.officeTexture = image;
+      this.officeTextureLoaded = true;
+      this.worldLayerDirty = true;
+    };
+    image.onerror = () => {
+      this.officeTexture = null;
+      this.officeTextureLoaded = false;
+      this.worldLayerDirty = true;
+    };
+    image.src = this.officeTexturePath;
   }
 
   public setPointerPosition(pixelX: number, pixelY: number): void {
@@ -1169,11 +1215,21 @@ export class Game {
               ? '#99f6e4'
               : '#fde68a';
 
-      this.worldContext.fillStyle = floor.occupied ? zoneColor : 'rgba(51, 65, 85, 0.7)';
-      this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, this.grid.cellSize);
+      if (floor.zone === 'OFFICE' && floor.occupied && this.officeTextureLoaded && this.officeTexture) {
+        this.worldContext.drawImage(
+          this.officeTexture,
+          tile.x,
+          tile.y,
+          this.grid.cellSize,
+          this.grid.cellSize,
+        );
+      } else {
+        this.worldContext.fillStyle = floor.occupied ? zoneColor : 'rgba(51, 65, 85, 0.7)';
+        this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, this.grid.cellSize);
 
-      this.worldContext.fillStyle = floor.occupied ? topAccent : 'rgba(148, 163, 184, 0.45)';
-      this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, 6);
+        this.worldContext.fillStyle = floor.occupied ? topAccent : 'rgba(148, 163, 184, 0.45)';
+        this.worldContext.fillRect(tile.x, tile.y, this.grid.cellSize, 6);
+      }
 
       const canLightWindows =
         floor.occupied && floor.zone !== 'HALLWAY' && floor.zone !== 'LOBBY';
