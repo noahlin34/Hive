@@ -23,41 +23,86 @@ export type AgentMood = 'happy' | 'neutral' | 'angry';
 
 export type AgentPhase =
   | 'IDLE'
-  | 'WALK_TO_ELEVATOR'
-  | 'WAIT_ELEVATOR'
-  | 'RIDING_ELEVATOR'
-  | 'WALK_TO_DESTINATION'
-  | 'AT_DESTINATION';
+  | 'WALK_TO_SHAFT'
+  | 'WAIT_AT_SHAFT'
+  | 'RIDING'
+  | 'WALK_TO_TARGET'
+  | 'AT_TARGET';
+
+export type TravelDirection = 'UP' | 'DOWN' | 'NONE';
 
 export interface Agent {
   name: string;
   mood: AgentMood;
   speed: number;
   phase: AgentPhase;
-  assignedElevatorX: number | null;
+  stress: number;
+  waitMs: number;
   sourceFloorY: number | null;
   targetFloorY: number | null;
-  destinationX: number;
-  destinationY: number;
+  targetX: number;
+  targetY: number;
+  desiredDirection: TravelDirection;
+  assignedShaftX: number | null;
+  waitX: number | null;
+  assignedCarId: EntityId | null;
   callRegistered: boolean;
   despawnOnArrival: boolean;
 }
 
+export type ScheduleStage =
+  | 'COMMUTE_TO_OFFICE'
+  | 'AT_OFFICE'
+  | 'TO_LUNCH'
+  | 'AT_LUNCH'
+  | 'RETURN_TO_OFFICE'
+  | 'TO_HOME';
+
+export interface Schedule {
+  role: 'OFFICE_WORKER';
+  stage: ScheduleStage;
+  officeX: number;
+  officeY: number;
+  homeX: number;
+  lunchReleaseMinute: number | null;
+}
+
+export type RoomZone = 'HALLWAY' | 'LOBBY' | 'OFFICE' | 'CONDO' | 'FOOD_COURT';
+
 export interface Floor {
   kind: 'floor';
+  zone: RoomZone;
+  occupied: boolean;
+  rent: number;
+  windowSeed: number;
 }
 
 export interface Elevator {
-  kind: 'elevator';
+  kind: 'elevator_shaft';
 }
 
-export type ElevatorState = 'IDLE' | 'MOVING_UP' | 'MOVING_DOWN' | 'LOADING';
+export type ElevatorState = 'IDLE' | 'MOVING' | 'LOADING' | 'UNLOADING';
 
 export interface ElevatorCar {
   state: ElevatorState;
+  direction: TravelDirection;
   speed: number;
-  pendingStops: number[];
-  loadTimerMs: number;
+  column: number;
+  bankId: number;
+  stopQueue: number[];
+  phaseTimerMs: number;
+}
+
+export interface Influence {
+  noiseRadius: number;
+  noiseIntensity: number;
+}
+
+export interface Condo {
+  noiseSensitivity: number;
+  warningActive: boolean;
+  warningMinutes: number;
+  occupied: boolean;
 }
 
 export interface FloatingText {
@@ -73,9 +118,12 @@ export interface ComponentRegistry {
   velocity: Velocity;
   renderable: Renderable;
   agent: Agent;
+  schedule: Schedule;
   floor: Floor;
   elevator: Elevator;
   elevatorCar: ElevatorCar;
+  influence: Influence;
+  condo: Condo;
   floatingText: FloatingText;
 }
 
@@ -91,11 +139,6 @@ export interface GridProjector {
   gridToScreen(gridX: number, gridY: number): { x: number; y: number };
 }
 
-export interface HorizontalBounds {
-  minX: number;
-  maxX: number;
-}
-
 export interface PlacementPreview {
   cell: GridCell;
   valid: boolean;
@@ -103,9 +146,32 @@ export interface PlacementPreview {
   tool: Tool;
 }
 
+export interface FloorDragPreview {
+  cells: GridCell[];
+  valid: boolean;
+  affordable: boolean;
+  cost: number;
+}
+
 export interface PlacementResult {
   changedMap: boolean;
   spent: number;
+  errorMessage?: string;
+}
+
+interface ElevatorBank {
+  id: number;
+  columns: number[];
+}
+
+const WAIT_STRESS_THRESHOLD_MS = 15000;
+const STRESS_GAIN_PER_SECOND = 6;
+const STRESS_DECAY_PER_SECOND = 2.2;
+
+const DISPATCH_DIRECTION_PENALTY = 8;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function moveTowards(
@@ -125,8 +191,35 @@ function moveTowards(
   };
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
+function computeDirection(sourceFloorY: number, targetFloorY: number): TravelDirection {
+  if (targetFloorY < sourceFloorY) {
+    return 'UP';
+  }
+
+  if (targetFloorY > sourceFloorY) {
+    return 'DOWN';
+  }
+
+  return 'NONE';
+}
+
+function dedupeStops(stops: number[]): number[] {
+  const result: number[] = [];
+
+  for (const stop of stops) {
+    if (result.includes(stop)) {
+      continue;
+    }
+
+    result.push(stop);
+  }
+
+  return result;
+}
+
+function pseudoRandom(seed: number): number {
+  const x = Math.sin(seed * 12.9898) * 43758.5453;
+  return x - Math.floor(x);
 }
 
 export class ECSWorld {
@@ -137,16 +230,18 @@ export class ECSWorld {
     velocity: new Map<EntityId, Velocity>(),
     renderable: new Map<EntityId, Renderable>(),
     agent: new Map<EntityId, Agent>(),
+    schedule: new Map<EntityId, Schedule>(),
     floor: new Map<EntityId, Floor>(),
     elevator: new Map<EntityId, Elevator>(),
     elevatorCar: new Map<EntityId, ElevatorCar>(),
+    influence: new Map<EntityId, Influence>(),
+    condo: new Map<EntityId, Condo>(),
     floatingText: new Map<EntityId, FloatingText>(),
   };
 
   public createEntity(): EntityId {
     const id = this.nextEntityId;
     this.nextEntityId += 1;
-
     this.entities.add(id);
     return id;
   }
@@ -178,6 +273,10 @@ export class ECSWorld {
     return this.components[key].get(entityId);
   }
 
+  public removeComponent<K extends ComponentKey>(entityId: EntityId, key: K): void {
+    this.components[key].delete(entityId);
+  }
+
   public query<K extends ComponentKey>(...required: K[]): EntityId[] {
     const result: EntityId[] = [];
 
@@ -195,40 +294,6 @@ export class ECSWorld {
   }
 }
 
-export class MovementSystem {
-  private readonly world: ECSWorld;
-  private readonly bounds: HorizontalBounds;
-
-  public constructor(world: ECSWorld, bounds: HorizontalBounds) {
-    this.world = world;
-    this.bounds = bounds;
-  }
-
-  public update(deltaMs: number): void {
-    const deltaSeconds = deltaMs / 1000;
-
-    for (const entityId of this.world.query('position', 'velocity')) {
-      const position = this.world.getComponent(entityId, 'position');
-      const velocity = this.world.getComponent(entityId, 'velocity');
-
-      if (!position || !velocity) {
-        continue;
-      }
-
-      position.x += velocity.dx * deltaSeconds;
-      position.y += velocity.dy * deltaSeconds;
-
-      if (position.x < this.bounds.minX) {
-        position.x = this.bounds.minX;
-        velocity.dx = Math.abs(velocity.dx);
-      } else if (position.x > this.bounds.maxX) {
-        position.x = this.bounds.maxX;
-        velocity.dx = -Math.abs(velocity.dx);
-      }
-    }
-  }
-}
-
 export class RenderSystem {
   private readonly world: ECSWorld;
   private readonly projector: GridProjector;
@@ -239,8 +304,73 @@ export class RenderSystem {
   }
 
   public render(ctx: CanvasRenderingContext2D): void {
+    this.renderElevatorCables(ctx);
     this.renderShapes(ctx);
+    this.renderCondoWarnings(ctx);
     this.renderFloatingText(ctx);
+  }
+
+  private renderElevatorCables(ctx: CanvasRenderingContext2D): void {
+    const boundsByColumn = new Map<number, { minY: number; maxY: number }>();
+
+    for (const shaftEntity of this.world.query('position', 'elevator')) {
+      const shaftPosition = this.world.getComponent(shaftEntity, 'position');
+      if (!shaftPosition) {
+        continue;
+      }
+
+      const existing = boundsByColumn.get(shaftPosition.x);
+      if (!existing) {
+        boundsByColumn.set(shaftPosition.x, {
+          minY: shaftPosition.y,
+          maxY: shaftPosition.y,
+        });
+      } else {
+        existing.minY = Math.min(existing.minY, shaftPosition.y);
+        existing.maxY = Math.max(existing.maxY, shaftPosition.y);
+      }
+    }
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
+    ctx.lineWidth = 2;
+
+    for (const carEntity of this.world.query('position', 'elevatorCar')) {
+      const car = this.world.getComponent(carEntity, 'elevatorCar');
+      const position = this.world.getComponent(carEntity, 'position');
+      if (!car || !position) {
+        continue;
+      }
+
+      const bounds = boundsByColumn.get(car.column);
+      if (!bounds) {
+        continue;
+      }
+
+      const centerX = this.projector.gridToScreen(car.column + 0.5, 0).x;
+      const topY = this.projector.gridToScreen(0, bounds.minY).y + 4;
+      const carCenterY = this.projector.gridToScreen(0, position.y + 0.5).y;
+
+      ctx.beginPath();
+      ctx.moveTo(centerX, topY);
+      ctx.lineTo(centerX, carCenterY);
+      ctx.stroke();
+
+      const mirroredGridY = bounds.minY + bounds.maxY - position.y;
+      const counterweightPixel = this.projector.gridToScreen(car.column + 0.08, mirroredGridY + 0.2);
+      const weightWidth = this.projector.cellSize * 0.26;
+      const weightHeight = this.projector.cellSize * 0.6;
+
+      ctx.fillStyle = 'rgba(203, 213, 225, 0.65)';
+      ctx.fillRect(counterweightPixel.x, counterweightPixel.y, weightWidth, weightHeight);
+
+      ctx.beginPath();
+      ctx.moveTo(counterweightPixel.x + weightWidth * 0.5, topY);
+      ctx.lineTo(counterweightPixel.x + weightWidth * 0.5, counterweightPixel.y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
   }
 
   private renderShapes(ctx: CanvasRenderingContext2D): void {
@@ -254,16 +384,19 @@ export class RenderSystem {
 
       const { x: pixelX, y: pixelY } = this.projector.gridToScreen(position.x, position.y);
       const size = this.projector.cellSize * (renderable.sizeScale ?? 1);
+      const offset = (this.projector.cellSize - size) * 0.5;
+      const drawX = pixelX + offset;
+      const drawY = pixelY + offset;
 
       if (renderable.shape === 'circle') {
         const radius = size * 0.5;
         ctx.fillStyle = renderable.color;
         ctx.beginPath();
-        ctx.arc(pixelX + radius, pixelY + radius, radius, 0, Math.PI * 2);
+        ctx.arc(drawX + radius, drawY + radius, radius, 0, Math.PI * 2);
         ctx.fill();
       } else {
         ctx.fillStyle = renderable.color;
-        ctx.fillRect(pixelX, pixelY, size, size);
+        ctx.fillRect(drawX, drawY, size, size);
       }
 
       const agent = this.world.getComponent(entityId, 'agent');
@@ -277,19 +410,47 @@ export class RenderSystem {
 
         ctx.strokeStyle = moodOutline;
         ctx.lineWidth = 2;
-        ctx.strokeRect(pixelX + 1, pixelY + 1, size - 2, size - 2);
+        ctx.strokeRect(drawX + 1, drawY + 1, size - 2, size - 2);
       }
 
       const elevatorCar = this.world.getComponent(entityId, 'elevatorCar');
       if (elevatorCar) {
         const glow =
-          elevatorCar.state === 'LOADING'
-            ? 'rgba(56, 189, 248, 0.8)'
-            : 'rgba(148, 163, 184, 0.8)';
+          elevatorCar.state === 'LOADING' || elevatorCar.state === 'UNLOADING'
+            ? 'rgba(56, 189, 248, 0.85)'
+            : 'rgba(148, 163, 184, 0.75)';
+
         ctx.strokeStyle = glow;
         ctx.lineWidth = 2;
-        ctx.strokeRect(pixelX + 2, pixelY + 2, size - 4, size - 4);
+        ctx.strokeRect(drawX + 2, drawY + 2, size - 4, size - 4);
       }
+    }
+  }
+
+  private renderCondoWarnings(ctx: CanvasRenderingContext2D): void {
+    for (const entityId of this.world.query('position', 'floor', 'condo')) {
+      const position = this.world.getComponent(entityId, 'position');
+      const condo = this.world.getComponent(entityId, 'condo');
+
+      if (!position || !condo || !condo.warningActive) {
+        continue;
+      }
+
+      const bubble = this.projector.gridToScreen(position.x + 0.5, position.y - 0.35);
+      const radius = this.projector.cellSize * 0.2;
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.92)';
+      ctx.beginPath();
+      ctx.arc(bubble.x, bubble.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '700 11px "IBM Plex Sans", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('!', bubble.x, bubble.y + 0.5);
+      ctx.restore();
     }
   }
 
@@ -344,7 +505,7 @@ export class MouseSystem {
   }
 
   public hasFloorAt(cell: GridCell): boolean {
-    return this.hasStructureAt(cell, 'floor');
+    return this.getEntityByTypeAt(cell, 'floor') !== null;
   }
 
   public getPlacementPreview(tool: Tool, funds: number): PlacementPreview | null {
@@ -352,12 +513,63 @@ export class MouseSystem {
       return null;
     }
 
-    const cost = TOOL_COSTS[tool];
+    const cost =
+      tool === Tool.FLOOR
+        ? TOOL_COSTS[Tool.FLOOR]
+        : tool === Tool.OFFICE || tool === Tool.CONDO || tool === Tool.FOOD_COURT
+          ? this.getRoomFootprint(tool, this.hoveredCell).length * TOOL_COSTS[tool]
+          : TOOL_COSTS[tool];
     return {
       cell: this.hoveredCell,
       valid: this.isValidPlacement(tool, this.hoveredCell),
       affordable: funds >= cost,
       tool,
+    };
+  }
+
+  public getFloorDragPreview(
+    start: GridCell,
+    end: GridCell,
+    funds: number,
+  ): FloorDragPreview {
+    const cells = this.getFloorDragCells(start, end);
+    const valid = this.canBuildFloorCells(cells);
+    const cost = cells.length * TOOL_COSTS[Tool.FLOOR];
+
+    return {
+      cells,
+      valid,
+      affordable: funds >= cost,
+      cost,
+    };
+  }
+
+  public applyFloorDrag(start: GridCell, end: GridCell, funds: number): PlacementResult {
+    const preview = this.getFloorDragPreview(start, end, funds);
+
+    if (!preview.valid) {
+      return {
+        changedMap: false,
+        spent: 0,
+        errorMessage: 'Invalid floor placement',
+      };
+    }
+
+    if (!preview.affordable) {
+      return {
+        changedMap: false,
+        spent: 0,
+        errorMessage: 'Insufficient funds',
+      };
+    }
+
+    for (const cell of preview.cells) {
+      this.spawnFloorSegment(cell);
+    }
+
+    return {
+      changedMap: preview.cells.length > 0,
+      spent: preview.cost,
     };
   }
 
@@ -377,25 +589,30 @@ export class MouseSystem {
       return { changedMap: true, spent: 0 };
     }
 
-    const cost = TOOL_COSTS[tool];
-    if (funds < cost) {
-      return { changedMap: false, spent: 0 };
-    }
-
-    if (!this.isValidPlacement(tool, cell)) {
-      return { changedMap: false, spent: 0 };
-    }
-
-    const entity = this.world.createEntity();
-    this.world.addComponent(entity, 'position', { x: cell.x, y: cell.y });
-
     if (tool === Tool.FLOOR) {
-      this.world.addComponent(entity, 'floor', { kind: 'floor' });
-    } else if (tool === Tool.ELEVATOR) {
-      this.world.addComponent(entity, 'elevator', { kind: 'elevator' });
+      return this.applyFloorDrag(cell, cell, funds);
     }
 
-    return { changedMap: true, spent: cost };
+    if (tool === Tool.OFFICE || tool === Tool.CONDO || tool === Tool.FOOD_COURT) {
+      return this.applyRoomPlacement(tool, cell, funds);
+    }
+
+    const cost = TOOL_COSTS[tool];
+    if (funds < cost || !this.isValidPlacement(tool, cell)) {
+      return {
+        changedMap: false,
+        spent: 0,
+      };
+    }
+
+    if (tool === Tool.ELEVATOR) {
+      const entity = this.world.createEntity();
+      this.world.addComponent(entity, 'position', { x: cell.x, y: cell.y });
+      this.world.addComponent(entity, 'elevator', { kind: 'elevator_shaft' });
+      return { changedMap: true, spent: cost };
+    }
+
+    return { changedMap: false, spent: 0 };
   }
 
   private isValidPlacement(tool: Tool, cell: GridCell): boolean {
@@ -403,22 +620,198 @@ export class MouseSystem {
       return this.getStructureEntityAt(cell) !== null;
     }
 
-    if (this.getStructureEntityAt(cell) !== null) {
-      return false;
+    if (tool === Tool.ELEVATOR) {
+      if (this.getStructureEntityAt(cell) !== null) {
+        return false;
+      }
+      return this.isValidElevatorPlacement(cell);
     }
 
     if (tool === Tool.FLOOR) {
-      return this.isValidFloorPlacement(cell);
+      if (this.getStructureEntityAt(cell) !== null) {
+        return false;
+      }
+
+      return this.isValidFloorSegmentPlacement(cell, new Set<string>());
     }
 
-    if (tool === Tool.ELEVATOR) {
-      return this.isValidElevatorPlacement(cell);
+    if (tool === Tool.OFFICE || tool === Tool.CONDO || tool === Tool.FOOD_COURT) {
+      return this.canPlaceRoom(tool, cell);
     }
 
     return false;
   }
 
-  private isValidFloorPlacement(cell: GridCell): boolean {
+  private applyRoomPlacement(tool: Tool, anchor: GridCell, funds: number): PlacementResult {
+    const footprint = this.getRoomFootprint(tool, anchor);
+    const cost = footprint.length * TOOL_COSTS[tool];
+
+    if (funds < cost) {
+      return {
+        changedMap: false,
+        spent: 0,
+        errorMessage: 'Insufficient funds',
+      };
+    }
+
+    const placementCheck = this.checkRoomPlacement(tool, anchor);
+    if (!placementCheck.valid) {
+      return {
+        changedMap: false,
+        spent: 0,
+        errorMessage: placementCheck.requiresFloor ? 'Requires Floor' : 'Invalid placement',
+      };
+    }
+
+    for (const cell of footprint) {
+      const floorEntity = this.getEntityByTypeAt(cell, 'floor');
+      if (floorEntity === null) {
+        continue;
+      }
+
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!floor) {
+        continue;
+      }
+
+      floor.zone =
+        tool === Tool.OFFICE
+          ? 'OFFICE'
+          : tool === Tool.CONDO
+            ? 'CONDO'
+            : 'FOOD_COURT';
+      floor.occupied = true;
+      floor.rent = floor.zone === 'FOOD_COURT' ? 0 : 100;
+
+      if (floor.zone === 'OFFICE') {
+        this.world.addComponent(floorEntity, 'influence', {
+          noiseRadius: 2,
+          noiseIntensity: 5,
+        });
+        this.world.removeComponent(floorEntity, 'condo');
+      } else if (floor.zone === 'CONDO') {
+        this.world.removeComponent(floorEntity, 'influence');
+        this.world.addComponent(floorEntity, 'condo', {
+          noiseSensitivity: 9 + Math.floor(Math.random() * 6),
+          warningActive: false,
+          warningMinutes: 0,
+          occupied: true,
+        });
+      } else {
+        this.world.removeComponent(floorEntity, 'influence');
+        this.world.removeComponent(floorEntity, 'condo');
+      }
+    }
+
+    return {
+      changedMap: true,
+      spent: cost,
+    };
+  }
+
+  private canPlaceRoom(tool: Tool, anchor: GridCell): boolean {
+    return this.checkRoomPlacement(tool, anchor).valid;
+  }
+
+  private checkRoomPlacement(
+    tool: Tool,
+    anchor: GridCell,
+  ): { valid: boolean; requiresFloor: boolean } {
+    const footprint = this.getRoomFootprint(tool, anchor);
+
+    if (tool === Tool.CONDO && anchor.y === this.groundRow) {
+      return { valid: false, requiresFloor: false };
+    }
+
+    if (tool === Tool.FOOD_COURT && anchor.y !== this.groundRow) {
+      return { valid: false, requiresFloor: false };
+    }
+
+    for (const cell of footprint) {
+      const floorEntity = this.getEntityByTypeAt(cell, 'floor');
+      if (floorEntity === null) {
+        return { valid: false, requiresFloor: true };
+      }
+
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!floor) {
+        return { valid: false, requiresFloor: true };
+      }
+
+      if (floor.zone !== 'HALLWAY' && floor.zone !== 'LOBBY') {
+        return { valid: false, requiresFloor: false };
+      }
+    }
+
+    return { valid: true, requiresFloor: false };
+  }
+
+  private getRoomFootprint(tool: Tool, anchor: GridCell): GridCell[] {
+    if (tool !== Tool.OFFICE && tool !== Tool.CONDO && tool !== Tool.FOOD_COURT) {
+      return [anchor];
+    }
+
+    const width = tool === Tool.FOOD_COURT ? 3 : 2;
+    const footprint: GridCell[] = [];
+
+    for (let offset = 0; offset < width; offset += 1) {
+      footprint.push({ x: anchor.x + offset, y: anchor.y });
+    }
+
+    return footprint;
+  }
+
+  private spawnFloorSegment(cell: GridCell): void {
+    const entity = this.world.createEntity();
+    this.world.addComponent(entity, 'position', { x: cell.x, y: cell.y });
+    this.world.addComponent(entity, 'floor', {
+      kind: 'floor',
+      zone: cell.y === this.groundRow ? 'LOBBY' : 'HALLWAY',
+      occupied: true,
+      rent: 0,
+      windowSeed: Math.floor(pseudoRandom(entity + cell.x * 17 + cell.y * 31) * 10000),
+    });
+  }
+
+  private getFloorDragCells(start: GridCell, end: GridCell): GridCell[] {
+    const minX = Math.min(start.x, end.x);
+    const maxX = Math.max(start.x, end.x);
+    const y = start.y;
+    const cells: GridCell[] = [];
+
+    for (let x = minX; x <= maxX; x += 1) {
+      cells.push({ x, y });
+    }
+
+    return cells;
+  }
+
+  private canBuildFloorCells(cells: GridCell[]): boolean {
+    if (cells.length === 0) {
+      return false;
+    }
+
+    const planned = new Set(cells.map((cell) => this.cellKey(cell)));
+    let hasExternalSupport = cells[0].y === this.groundRow;
+
+    for (const cell of cells) {
+      if (this.getStructureEntityAt(cell) !== null) {
+        return false;
+      }
+
+      if (this.hasExistingFloorNeighbor(cell)) {
+        hasExternalSupport = true;
+      }
+
+      if (!this.isValidFloorSegmentPlacement(cell, planned)) {
+        return false;
+      }
+    }
+
+    return hasExternalSupport;
+  }
+
+  private isValidFloorSegmentPlacement(cell: GridCell, planned: Set<string>): boolean {
     if (cell.y === this.groundRow) {
       return true;
     }
@@ -430,13 +823,30 @@ export class MouseSystem {
       { x: cell.x, y: cell.y + 1 },
     ];
 
-    return neighbors.some((neighbor) => this.hasStructureAt(neighbor, 'floor'));
+    return neighbors.some((neighbor) => {
+      if (this.getEntityByTypeAt(neighbor, 'floor') !== null) {
+        return true;
+      }
+
+      return planned.has(this.cellKey(neighbor));
+    });
+  }
+
+  private hasExistingFloorNeighbor(cell: GridCell): boolean {
+    const neighbors: GridCell[] = [
+      { x: cell.x - 1, y: cell.y },
+      { x: cell.x + 1, y: cell.y },
+      { x: cell.x, y: cell.y - 1 },
+      { x: cell.x, y: cell.y + 1 },
+    ];
+
+    return neighbors.some((neighbor) => this.getEntityByTypeAt(neighbor, 'floor') !== null);
   }
 
   private isValidElevatorPlacement(cell: GridCell): boolean {
     const hasVerticalNeighbor =
-      this.hasStructureAt({ x: cell.x, y: cell.y - 1 }, 'elevator') ||
-      this.hasStructureAt({ x: cell.x, y: cell.y + 1 }, 'elevator');
+      this.getEntityByTypeAt({ x: cell.x, y: cell.y - 1 }, 'elevator') !== null ||
+      this.getEntityByTypeAt({ x: cell.x, y: cell.y + 1 }, 'elevator') !== null;
 
     return hasVerticalNeighbor || cell.y === this.groundRow;
   }
@@ -448,10 +858,6 @@ export class MouseSystem {
     }
 
     return this.getEntityByTypeAt(cell, 'elevator');
-  }
-
-  private hasStructureAt(cell: GridCell, type: StructureKey): boolean {
-    return this.getEntityByTypeAt(cell, type) !== null;
   }
 
   private getEntityByTypeAt(cell: GridCell, type: StructureKey): EntityId | null {
@@ -467,6 +873,10 @@ export class MouseSystem {
     }
 
     return null;
+  }
+
+  private cellKey(cell: GridCell): string {
+    return `${cell.x},${cell.y}`;
   }
 }
 
@@ -487,49 +897,52 @@ export class AgentSystem {
       return false;
     }
 
-    const sourceFloorY = Math.round(position.y + 1);
+    const sourceFloorY = Math.round(position.y);
 
-    agent.destinationX = targetFloor.x;
-    agent.destinationY = targetFloor.y;
+    agent.targetX = targetFloor.x;
+    agent.targetY = targetFloor.y;
     agent.targetFloorY = targetFloor.y;
     agent.sourceFloorY = sourceFloorY;
-    agent.despawnOnArrival = despawnOnArrival;
+    agent.desiredDirection = computeDirection(sourceFloorY, targetFloor.y);
+    agent.assignedCarId = null;
+    agent.waitX = null;
     agent.callRegistered = false;
-    agent.mood = 'neutral';
+    agent.waitMs = 0;
+    agent.despawnOnArrival = despawnOnArrival;
 
     if (sourceFloorY === targetFloor.y) {
-      agent.assignedElevatorX = null;
-      agent.phase = 'WALK_TO_DESTINATION';
+      agent.assignedShaftX = null;
+      agent.waitX = null;
+      agent.phase = 'WALK_TO_TARGET';
       return true;
     }
 
-    const candidateColumns = this.getElevatorColumnsForTrip(sourceFloorY, targetFloor.y);
-    if (candidateColumns.length === 0) {
+    const shafts = this.getCandidateShaftColumns(sourceFloorY, targetFloor.y);
+    if (shafts.length === 0) {
       agent.phase = 'IDLE';
       agent.mood = 'angry';
-      agent.assignedElevatorX = null;
       return false;
     }
 
-    const assignedElevator = this.selectBestElevatorColumn(
-      candidateColumns,
-      position.x,
-      targetFloor.x,
-    );
+    const assignedShaft = this.chooseBestShaftColumn(shafts, position.x, targetFloor.x);
+    const waitX = this.resolveWaitXForShaft(assignedShaft, sourceFloorY, position.x);
+    if (waitX === null) {
+      agent.phase = 'IDLE';
+      agent.mood = 'angry';
+      return false;
+    }
 
-    agent.assignedElevatorX = assignedElevator;
-    agent.phase = 'WALK_TO_ELEVATOR';
+    agent.assignedShaftX = assignedShaft;
+    agent.waitX = waitX;
+    agent.phase = 'WALK_TO_SHAFT';
+    agent.mood = 'neutral';
     return true;
   }
 
   public issueTripForFirstAgent(targetFloor: GridCell, despawnOnArrival: boolean): boolean {
     for (const entityId of this.world.query('agent', 'position')) {
-      const agent = this.world.getComponent(entityId, 'agent');
-      if (!agent) {
-        continue;
-      }
-
-      if (agent.phase === 'RIDING_ELEVATOR') {
+      const schedule = this.world.getComponent(entityId, 'schedule');
+      if (schedule) {
         continue;
       }
 
@@ -550,130 +963,231 @@ export class AgentSystem {
         continue;
       }
 
-      if (agent.phase === 'WALK_TO_ELEVATOR') {
-        const sourceFloorY = agent.sourceFloorY;
-        const elevatorX = agent.assignedElevatorX;
+      if (agent.phase !== 'RIDING') {
+        const standingFloorY = Math.round(position.y);
+        if (!this.hasFloorAt(Math.round(position.x), standingFloorY)) {
+          this.world.destroyEntity(entityId);
+          continue;
+        }
+      }
 
-        if (sourceFloorY === null || elevatorX === null) {
+      if (agent.phase === 'WALK_TO_SHAFT') {
+        const shaftX = agent.assignedShaftX;
+        const waitX = agent.waitX;
+        const sourceFloor = agent.sourceFloorY;
+
+        if (shaftX === null || waitX === null || sourceFloor === null) {
           agent.phase = 'IDLE';
           continue;
         }
 
-        position.y = sourceFloorY - 1;
-        const step = moveTowards(position.x, elevatorX, agent.speed * deltaSeconds);
+        position.y = sourceFloor;
+        const step = moveTowards(position.x, waitX, agent.speed * deltaSeconds);
+
+        if (!this.hasFloorAt(Math.round(step.value), sourceFloor)) {
+          this.world.destroyEntity(entityId);
+          continue;
+        }
+
         position.x = step.value;
 
         if (step.arrived) {
-          agent.phase = 'WAIT_ELEVATOR';
+          agent.phase = 'WAIT_AT_SHAFT';
+          agent.waitMs = 0;
         }
 
+        this.coolStress(agent, deltaSeconds);
         continue;
       }
 
-      if (agent.phase === 'WAIT_ELEVATOR') {
-        const sourceFloorY = agent.sourceFloorY;
-        if (sourceFloorY !== null) {
-          position.y = sourceFloorY - 1;
+      if (agent.phase === 'WAIT_AT_SHAFT') {
+        const sourceFloor = agent.sourceFloorY;
+        const waitX = agent.waitX;
+
+        if (sourceFloor !== null) {
+          position.y = sourceFloor;
         }
+
+        if (waitX !== null) {
+          position.x = waitX;
+        }
+
+        agent.waitMs += deltaMs;
+
+        if (agent.waitMs > WAIT_STRESS_THRESHOLD_MS) {
+          const overtimeSeconds = deltaMs / 1000;
+          agent.stress = clamp(agent.stress + overtimeSeconds * STRESS_GAIN_PER_SECOND, 0, 100);
+        }
+
+        agent.mood = agent.stress > 60 ? 'angry' : 'neutral';
         continue;
       }
 
-      if (agent.phase === 'WALK_TO_DESTINATION') {
-        position.y = agent.destinationY - 1;
-
-        const step = moveTowards(position.x, agent.destinationX, agent.speed * deltaSeconds);
-        position.x = step.value;
-
-        if (step.arrived) {
-          agent.phase = 'AT_DESTINATION';
-          agent.mood = 'happy';
-
-          if (agent.despawnOnArrival && agent.destinationY === this.groundRow) {
-            this.world.destroyEntity(entityId);
+      if (agent.phase === 'RIDING') {
+        const assignedCarId = agent.assignedCarId;
+        if (assignedCarId !== null) {
+          const carPosition = this.world.getComponent(assignedCarId, 'position');
+          if (carPosition) {
+            position.x = carPosition.x;
+            position.y = carPosition.y;
           }
         }
+
+        this.coolStress(agent, deltaSeconds);
+        continue;
+      }
+
+      if (agent.phase === 'WALK_TO_TARGET') {
+        position.y = agent.targetY;
+
+        const step = moveTowards(position.x, agent.targetX, agent.speed * deltaSeconds);
+
+        if (!this.hasFloorAt(Math.round(step.value), agent.targetY)) {
+          this.world.destroyEntity(entityId);
+          continue;
+        }
+
+        position.x = step.value;
+
+        if (step.arrived) {
+          agent.phase = 'AT_TARGET';
+          agent.mood = 'happy';
+
+          if (agent.despawnOnArrival && agent.targetY === this.groundRow) {
+            this.world.destroyEntity(entityId);
+            continue;
+          }
+        }
+
+        this.coolStress(agent, deltaSeconds);
+        continue;
+      }
+
+      if (agent.phase === 'AT_TARGET' || agent.phase === 'IDLE') {
+        this.coolStress(agent, deltaSeconds);
       }
     }
   }
 
-  private getElevatorColumnsForTrip(sourceFloorY: number, targetFloorY: number): number[] {
-    const floorSetByColumn = new Map<number, Set<number>>();
+  private coolStress(agent: Agent, deltaSeconds: number): void {
+    agent.stress = clamp(agent.stress - deltaSeconds * STRESS_DECAY_PER_SECOND, 0, 100);
 
-    for (const elevatorEntity of this.world.query('position', 'elevator')) {
-      const position = this.world.getComponent(elevatorEntity, 'position');
+    if (agent.stress > 65) {
+      agent.mood = 'angry';
+      return;
+    }
+
+    if (agent.phase === 'AT_TARGET') {
+      agent.mood = 'happy';
+      return;
+    }
+
+    agent.mood = 'neutral';
+  }
+
+  private getCandidateShaftColumns(sourceFloorY: number, targetFloorY: number): number[] {
+    const floorsByColumn = new Map<number, Set<number>>();
+
+    for (const shaftEntity of this.world.query('position', 'elevator')) {
+      const shaftPosition = this.world.getComponent(shaftEntity, 'position');
+      if (!shaftPosition) {
+        continue;
+      }
+
+      const floors = floorsByColumn.get(shaftPosition.x) ?? new Set<number>();
+      floors.add(shaftPosition.y);
+      floorsByColumn.set(shaftPosition.x, floors);
+    }
+
+    const candidates: number[] = [];
+
+    for (const [column, floors] of floorsByColumn) {
+      if (floors.has(sourceFloorY) && floors.has(targetFloorY)) {
+        candidates.push(column);
+      }
+    }
+
+    return candidates;
+  }
+
+  private chooseBestShaftColumn(
+    columns: number[],
+    sourceX: number,
+    destinationX: number,
+  ): number {
+    let best = columns[0];
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const column of columns) {
+      const score = Math.abs(sourceX - column) + Math.abs(destinationX - column);
+      if (score < bestScore) {
+        bestScore = score;
+        best = column;
+      }
+    }
+
+    return best;
+  }
+
+  private resolveWaitXForShaft(
+    shaftX: number,
+    floorY: number,
+    preferredX: number,
+  ): number | null {
+    const candidates = [shaftX - 1, shaftX + 1];
+
+    let bestX: number | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const candidateX of candidates) {
+      if (!this.hasFloorAt(candidateX, floorY)) {
+        continue;
+      }
+
+      const distance = Math.abs(candidateX - preferredX);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestX = candidateX;
+      }
+    }
+
+    return bestX;
+  }
+
+  private hasFloorAt(x: number, y: number): boolean {
+    for (const entityId of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(entityId, 'position');
       if (!position) {
         continue;
       }
 
-      const column = position.x;
-      const floors = floorSetByColumn.get(column) ?? new Set<number>();
-      floors.add(position.y);
-      floorSetByColumn.set(column, floors);
-    }
-
-    const validColumns: number[] = [];
-
-    for (const [column, floors] of floorSetByColumn) {
-      if (floors.has(sourceFloorY) && floors.has(targetFloorY)) {
-        validColumns.push(column);
+      if (position.x === x && position.y === y) {
+        return true;
       }
     }
 
-    return validColumns;
-  }
-
-  private selectBestElevatorColumn(
-    candidateColumns: number[],
-    sourceX: number,
-    destinationX: number,
-  ): number {
-    let bestColumn = candidateColumns[0];
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    for (const column of candidateColumns) {
-      const score = Math.abs(sourceX - column) + Math.abs(destinationX - column);
-      if (score < bestScore) {
-        bestScore = score;
-        bestColumn = column;
-      }
-    }
-
-    return bestColumn;
+    return false;
   }
 }
 
 export class ElevatorSystem {
   private readonly world: ECSWorld;
-  private readonly loadingDurationMs = 500;
+  private readonly unloadDurationMs = 450;
+  private readonly loadDurationMs = 500;
 
   public constructor(world: ECSWorld) {
     this.world = world;
   }
 
   public update(deltaMs: number): void {
-    const shaftFloorsByColumn = this.getShaftFloorsByColumn();
-    this.syncElevatorCars(shaftFloorsByColumn);
+    const floorsByColumn = this.getShaftFloorsByColumn();
+    const banks = this.buildBanks(floorsByColumn);
+    const bankByColumn = this.buildBankLookup(banks);
 
-    for (const carEntity of this.world.query('position', 'elevatorCar')) {
-      const position = this.world.getComponent(carEntity, 'position');
-      const car = this.world.getComponent(carEntity, 'elevatorCar');
-
-      if (!position || !car) {
-        continue;
-      }
-
-      const column = Math.round(position.x);
-      const servedFloors = shaftFloorsByColumn.get(column);
-
-      if (!servedFloors) {
-        continue;
-      }
-
-      this.registerWaitingCalls(column, servedFloors, car);
-      this.prunePendingStops(car, servedFloors);
-      this.advanceElevatorState(position, car, column, deltaMs);
-      this.syncRidingAgents(column, position.y);
-    }
+    this.syncCars(floorsByColumn, bankByColumn);
+    this.dispatchCalls(floorsByColumn, banks);
+    this.updateCars(deltaMs, floorsByColumn);
+    this.syncRiders();
   }
 
   private getShaftFloorsByColumn(): Map<number, Set<number>> {
@@ -693,20 +1207,78 @@ export class ElevatorSystem {
     return result;
   }
 
-  private syncElevatorCars(shaftFloorsByColumn: Map<number, Set<number>>): void {
+  private buildBanks(floorsByColumn: Map<number, Set<number>>): ElevatorBank[] {
+    const sortedColumns = Array.from(floorsByColumn.keys()).sort((a, b) => a - b);
+    const banks: ElevatorBank[] = [];
+
+    if (sortedColumns.length === 0) {
+      return banks;
+    }
+
+    let activeColumns: number[] = [sortedColumns[0]];
+
+    for (let index = 1; index < sortedColumns.length; index += 1) {
+      const column = sortedColumns[index];
+      const previous = sortedColumns[index - 1];
+
+      if (column - previous <= 1) {
+        activeColumns.push(column);
+      } else {
+        banks.push({
+          id: banks.length + 1,
+          columns: activeColumns,
+        });
+        activeColumns = [column];
+      }
+    }
+
+    banks.push({
+      id: banks.length + 1,
+      columns: activeColumns,
+    });
+
+    return banks;
+  }
+
+  private buildBankLookup(banks: ElevatorBank[]): Map<number, ElevatorBank> {
+    const result = new Map<number, ElevatorBank>();
+
+    for (const bank of banks) {
+      for (const column of bank.columns) {
+        result.set(column, bank);
+      }
+    }
+
+    return result;
+  }
+
+  private syncCars(
+    floorsByColumn: Map<number, Set<number>>,
+    bankByColumn: Map<number, ElevatorBank>,
+  ): void {
     const carsByColumn = new Map<number, EntityId>();
 
     for (const carEntity of this.world.query('position', 'elevatorCar')) {
-      const position = this.world.getComponent(carEntity, 'position');
-      if (!position) {
+      const car = this.world.getComponent(carEntity, 'elevatorCar');
+      if (!car) {
         continue;
       }
 
-      carsByColumn.set(Math.round(position.x), carEntity);
+      carsByColumn.set(car.column, carEntity);
     }
 
-    for (const [column, servedFloors] of shaftFloorsByColumn) {
-      if (carsByColumn.has(column)) {
+    for (const [column, servedFloors] of floorsByColumn) {
+      const bank = bankByColumn.get(column);
+      if (!bank) {
+        continue;
+      }
+
+      const existingCarId = carsByColumn.get(column);
+      if (existingCarId !== undefined) {
+        const existingCar = this.world.getComponent(existingCarId, 'elevatorCar');
+        if (existingCar) {
+          existingCar.bankId = bank.id;
+        }
         continue;
       }
 
@@ -717,18 +1289,20 @@ export class ElevatorSystem {
       this.world.addComponent(carEntity, 'renderable', {
         color: '#38bdf8',
         shape: 'square',
-        sizeScale: 1,
       });
       this.world.addComponent(carEntity, 'elevatorCar', {
         state: 'IDLE',
-        speed: 2.4,
-        pendingStops: [],
-        loadTimerMs: 0,
+        direction: 'NONE',
+        speed: 2.8,
+        column,
+        bankId: bank.id,
+        stopQueue: [],
+        phaseTimerMs: 0,
       });
     }
 
     for (const [column, carEntity] of carsByColumn) {
-      if (shaftFloorsByColumn.has(column)) {
+      if (floorsByColumn.has(column)) {
         continue;
       }
 
@@ -736,194 +1310,445 @@ export class ElevatorSystem {
 
       for (const agentEntity of this.world.query('agent')) {
         const agent = this.world.getComponent(agentEntity, 'agent');
-        if (!agent) {
+        if (!agent || agent.assignedCarId !== carEntity) {
           continue;
         }
 
-        if (agent.assignedElevatorX === column) {
-          agent.phase = 'IDLE';
-          agent.assignedElevatorX = null;
-          agent.callRegistered = false;
-          agent.mood = 'angry';
-        }
+        agent.assignedCarId = null;
+        agent.waitX = null;
+        agent.callRegistered = false;
+        agent.phase = 'WAIT_AT_SHAFT';
       }
     }
   }
 
-  private registerWaitingCalls(
-    column: number,
-    servedFloors: Set<number>,
-    car: ElevatorCar,
+  private dispatchCalls(
+    floorsByColumn: Map<number, Set<number>>,
+    banks: ElevatorBank[],
   ): void {
-    for (const agentEntity of this.world.query('agent')) {
+    const carsByBank = new Map<number, EntityId[]>();
+
+    for (const carEntity of this.world.query('position', 'elevatorCar')) {
+      const car = this.world.getComponent(carEntity, 'elevatorCar');
+      if (!car) {
+        continue;
+      }
+
+      const inBank = carsByBank.get(car.bankId) ?? [];
+      inBank.push(carEntity);
+      carsByBank.set(car.bankId, inBank);
+    }
+
+    for (const agentEntity of this.world.query('position', 'agent')) {
       const agent = this.world.getComponent(agentEntity, 'agent');
-      if (!agent) {
+      if (!agent || agent.phase !== 'WAIT_AT_SHAFT') {
         continue;
       }
 
-      if (agent.phase === 'RIDING_ELEVATOR' && agent.assignedElevatorX === column) {
-        const targetFloor = agent.targetFloorY;
-        if (targetFloor !== null && servedFloors.has(targetFloor)) {
-          this.addStop(car, targetFloor);
-        }
+      if (agent.callRegistered && agent.assignedCarId !== null) {
         continue;
       }
 
-      if (agent.phase !== 'WAIT_ELEVATOR' || agent.assignedElevatorX !== column) {
-        continue;
-      }
-
-      if (agent.callRegistered) {
-        continue;
-      }
-
+      const shaftX = agent.assignedShaftX;
       const sourceFloor = agent.sourceFloorY;
       const targetFloor = agent.targetFloorY;
-
-      if (sourceFloor === null || targetFloor === null) {
+      if (shaftX === null || sourceFloor === null || targetFloor === null) {
         continue;
       }
 
-      if (!servedFloors.has(sourceFloor) || !servedFloors.has(targetFloor)) {
-        agent.phase = 'IDLE';
-        agent.assignedElevatorX = null;
-        agent.mood = 'angry';
+      const bank = banks.find((candidate) => candidate.columns.includes(shaftX));
+      if (!bank) {
         continue;
       }
 
-      this.addStop(car, sourceFloor);
-      this.addStop(car, targetFloor);
-      agent.callRegistered = true;
-    }
-  }
+      const carCandidates = carsByBank.get(bank.id) ?? [];
+      let bestCarEntity: EntityId | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
 
-  private prunePendingStops(car: ElevatorCar, servedFloors: Set<number>): void {
-    const unique: number[] = [];
-
-    for (const stop of car.pendingStops) {
-      if (!servedFloors.has(stop)) {
-        continue;
-      }
-
-      if (unique.includes(stop)) {
-        continue;
-      }
-
-      unique.push(stop);
-    }
-
-    car.pendingStops = unique;
-  }
-
-  private advanceElevatorState(
-    position: Position,
-    car: ElevatorCar,
-    column: number,
-    deltaMs: number,
-  ): void {
-    if (car.state === 'LOADING') {
-      car.loadTimerMs -= deltaMs;
-      if (car.loadTimerMs <= 0) {
-        car.loadTimerMs = 0;
-        car.state = 'IDLE';
-      }
-      return;
-    }
-
-    if (car.pendingStops.length === 0) {
-      car.state = 'IDLE';
-      return;
-    }
-
-    const targetFloor = car.pendingStops[0];
-
-    if (Math.abs(position.y - targetFloor) < 0.01) {
-      this.arriveAtStop(position, car, column, targetFloor);
-      return;
-    }
-
-    const direction = targetFloor < position.y ? -1 : 1;
-    car.state = direction < 0 ? 'MOVING_UP' : 'MOVING_DOWN';
-
-    position.y += direction * car.speed * (deltaMs / 1000);
-
-    const reached = direction < 0 ? position.y <= targetFloor : position.y >= targetFloor;
-    if (reached) {
-      this.arriveAtStop(position, car, column, targetFloor);
-    }
-  }
-
-  private arriveAtStop(
-    position: Position,
-    car: ElevatorCar,
-    column: number,
-    floor: number,
-  ): void {
-    position.y = floor;
-
-    if (car.pendingStops[0] === floor) {
-      car.pendingStops.shift();
-    } else {
-      car.pendingStops = car.pendingStops.filter((stop) => stop !== floor);
-    }
-
-    this.transferAgentsAtFloor(column, floor);
-
-    car.state = 'LOADING';
-    car.loadTimerMs = this.loadingDurationMs;
-  }
-
-  private transferAgentsAtFloor(column: number, floor: number): void {
-    for (const agentEntity of this.world.query('position', 'agent')) {
-      const position = this.world.getComponent(agentEntity, 'position');
-      const agent = this.world.getComponent(agentEntity, 'agent');
-
-      if (!position || !agent || agent.assignedElevatorX !== column) {
-        continue;
-      }
-
-      if (agent.phase === 'RIDING_ELEVATOR') {
-        if (agent.targetFloorY === floor) {
-          position.x = column;
-          position.y = floor - 1;
-          agent.phase = 'WALK_TO_DESTINATION';
-          agent.sourceFloorY = floor;
-          agent.callRegistered = false;
-          agent.assignedElevatorX = null;
+      for (const carEntity of carCandidates) {
+        const car = this.world.getComponent(carEntity, 'elevatorCar');
+        const carPosition = this.world.getComponent(carEntity, 'position');
+        if (!car || !carPosition) {
+          continue;
         }
+
+        const servedFloors = floorsByColumn.get(car.column);
+        if (!servedFloors || !servedFloors.has(sourceFloor) || !servedFloors.has(targetFloor)) {
+          continue;
+        }
+
+        const directionPenalty =
+          car.direction === 'NONE' || car.direction === agent.desiredDirection
+            ? 0
+            : DISPATCH_DIRECTION_PENALTY;
+
+        const score =
+          Math.abs(carPosition.y - sourceFloor) +
+          directionPenalty +
+          car.stopQueue.length * 1.4 +
+          Math.abs(car.column - shaftX) * 0.8;
+
+        if (score < bestScore) {
+          bestScore = score;
+          bestCarEntity = carEntity;
+        }
+      }
+
+      if (bestCarEntity === null) {
         continue;
       }
 
-      if (agent.phase === 'WAIT_ELEVATOR' && agent.sourceFloorY === floor) {
-        agent.phase = 'RIDING_ELEVATOR';
-        position.x = column;
-        position.y = floor;
+      const selectedCar = this.world.getComponent(bestCarEntity, 'elevatorCar');
+      if (!selectedCar) {
+        continue;
+      }
+
+      this.addStop(selectedCar, sourceFloor);
+      this.addStop(selectedCar, targetFloor);
+
+      agent.assignedCarId = bestCarEntity;
+      agent.callRegistered = true;
+
+      if (agent.assignedShaftX !== selectedCar.column) {
+        const waitX = this.resolveWaitXForShaft(
+          selectedCar.column,
+          sourceFloor,
+          agent.waitX ?? shaftX,
+        );
+        if (waitX === null) {
+          continue;
+        }
+
+        agent.assignedShaftX = selectedCar.column;
+        agent.waitX = waitX;
+        agent.phase = 'WALK_TO_SHAFT';
       }
     }
   }
 
-  private syncRidingAgents(column: number, elevatorY: number): void {
-    for (const agentEntity of this.world.query('position', 'agent')) {
-      const position = this.world.getComponent(agentEntity, 'position');
-      const agent = this.world.getComponent(agentEntity, 'agent');
+  private updateCars(
+    deltaMs: number,
+    floorsByColumn: Map<number, Set<number>>,
+  ): void {
+    const deltaSeconds = deltaMs / 1000;
 
-      if (!position || !agent) {
+    for (const carEntity of this.world.query('position', 'elevatorCar')) {
+      const car = this.world.getComponent(carEntity, 'elevatorCar');
+      const position = this.world.getComponent(carEntity, 'position');
+
+      if (!car || !position) {
         continue;
       }
 
-      if (agent.phase === 'RIDING_ELEVATOR' && agent.assignedElevatorX === column) {
-        position.x = column;
-        position.y = elevatorY;
+      const servedFloors = floorsByColumn.get(car.column);
+      if (!servedFloors) {
+        continue;
       }
+
+      car.stopQueue = dedupeStops(car.stopQueue.filter((stop) => servedFloors.has(stop)));
+
+      if (car.state === 'IDLE') {
+        car.direction = 'NONE';
+
+        if (car.stopQueue.length > 0) {
+          car.state = 'MOVING';
+        }
+
+        continue;
+      }
+
+      if (car.state === 'MOVING') {
+        const targetFloor = car.stopQueue[0];
+
+        if (targetFloor === undefined) {
+          car.state = 'IDLE';
+          car.direction = 'NONE';
+          continue;
+        }
+
+        if (Math.abs(position.y - targetFloor) < 0.01) {
+          position.y = targetFloor;
+          this.unloadAtFloor(carEntity, car.column, targetFloor);
+          car.state = 'UNLOADING';
+          car.phaseTimerMs = this.unloadDurationMs;
+          car.direction = 'NONE';
+          continue;
+        }
+
+        const direction: TravelDirection = targetFloor < position.y ? 'UP' : 'DOWN';
+        car.direction = direction;
+        const speedDelta = car.speed * deltaSeconds;
+
+        if (direction === 'UP') {
+          position.y -= speedDelta;
+          if (position.y <= targetFloor) {
+            position.y = targetFloor;
+            this.unloadAtFloor(carEntity, car.column, targetFloor);
+            car.state = 'UNLOADING';
+            car.phaseTimerMs = this.unloadDurationMs;
+            car.direction = 'NONE';
+          }
+        } else {
+          position.y += speedDelta;
+          if (position.y >= targetFloor) {
+            position.y = targetFloor;
+            this.unloadAtFloor(carEntity, car.column, targetFloor);
+            car.state = 'UNLOADING';
+            car.phaseTimerMs = this.unloadDurationMs;
+            car.direction = 'NONE';
+          }
+        }
+
+        continue;
+      }
+
+      if (car.state === 'UNLOADING') {
+        car.phaseTimerMs -= deltaMs;
+        if (car.phaseTimerMs <= 0) {
+          const floor = Math.round(position.y);
+          this.loadAtFloor(carEntity, car.column, floor);
+          car.state = 'LOADING';
+          car.phaseTimerMs = this.loadDurationMs;
+        }
+
+        continue;
+      }
+
+      if (car.state === 'LOADING') {
+        car.phaseTimerMs -= deltaMs;
+        if (car.phaseTimerMs <= 0) {
+          const floor = Math.round(position.y);
+
+          if (car.stopQueue[0] === floor) {
+            car.stopQueue.shift();
+          } else {
+            car.stopQueue = car.stopQueue.filter((stop) => stop !== floor);
+          }
+
+          car.state = car.stopQueue.length > 0 ? 'MOVING' : 'IDLE';
+          car.direction = 'NONE';
+        }
+      }
+    }
+  }
+
+  private unloadAtFloor(carEntity: EntityId, column: number, floor: number): void {
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      const position = this.world.getComponent(agentEntity, 'position');
+
+      if (!agent || !position) {
+        continue;
+      }
+
+      if (agent.phase !== 'RIDING' || agent.assignedCarId !== carEntity) {
+        continue;
+      }
+
+      if (agent.targetFloorY !== floor) {
+        continue;
+      }
+
+      position.x = column;
+      position.y = floor;
+      agent.phase = 'WALK_TO_TARGET';
+      agent.sourceFloorY = floor;
+      agent.assignedCarId = null;
+      agent.assignedShaftX = null;
+      agent.waitX = null;
+      agent.callRegistered = false;
+      agent.waitMs = 0;
+    }
+  }
+
+  private loadAtFloor(carEntity: EntityId, column: number, floor: number): void {
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      const position = this.world.getComponent(agentEntity, 'position');
+
+      if (!agent || !position || agent.phase !== 'WAIT_AT_SHAFT') {
+        continue;
+      }
+
+      if (agent.assignedCarId !== carEntity || agent.assignedShaftX !== column) {
+        continue;
+      }
+
+      if (agent.sourceFloorY !== floor) {
+        continue;
+      }
+
+      agent.phase = 'RIDING';
+      agent.waitMs = 0;
+      position.x = column;
+      position.y = floor;
+    }
+  }
+
+  private syncRiders(): void {
+    for (const agentEntity of this.world.query('position', 'agent')) {
+      const agent = this.world.getComponent(agentEntity, 'agent');
+      const position = this.world.getComponent(agentEntity, 'position');
+
+      if (!agent || !position || agent.phase !== 'RIDING') {
+        continue;
+      }
+
+      const carId = agent.assignedCarId;
+      if (carId === null) {
+        agent.phase = 'WAIT_AT_SHAFT';
+        agent.callRegistered = false;
+        continue;
+      }
+
+      const carPosition = this.world.getComponent(carId, 'position');
+      if (!carPosition) {
+        agent.assignedCarId = null;
+        agent.callRegistered = false;
+        agent.phase = 'WAIT_AT_SHAFT';
+        continue;
+      }
+
+      position.x = carPosition.x;
+      position.y = carPosition.y;
     }
   }
 
   private addStop(car: ElevatorCar, floor: number): void {
-    if (car.pendingStops.includes(floor)) {
+    if (car.stopQueue.includes(floor)) {
       return;
     }
 
-    car.pendingStops.push(floor);
+    car.stopQueue.push(floor);
+  }
+
+  private resolveWaitXForShaft(
+    shaftX: number,
+    floorY: number,
+    preferredX: number,
+  ): number | null {
+    const candidates = [shaftX - 1, shaftX + 1];
+
+    let bestX: number | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const candidateX of candidates) {
+      if (!this.hasFloorAt(candidateX, floorY)) {
+        continue;
+      }
+
+      const distance = Math.abs(candidateX - preferredX);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestX = candidateX;
+      }
+    }
+
+    return bestX;
+  }
+
+  private hasFloorAt(x: number, y: number): boolean {
+    for (const entityId of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(entityId, 'position');
+      if (!position) {
+        continue;
+      }
+
+      if (position.x === x && position.y === y) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+}
+
+export class ZoningSystem {
+  private readonly world: ECSWorld;
+  private readonly gameMinutesPerRealMs: number;
+  private readonly checkIntervalMs = 10000;
+  private elapsedMs = 0;
+
+  public constructor(world: ECSWorld, gameMinutesPerRealMs: number) {
+    this.world = world;
+    this.gameMinutesPerRealMs = gameMinutesPerRealMs;
+  }
+
+  public update(deltaMs: number): boolean {
+    this.elapsedMs += deltaMs;
+
+    let changedMap = false;
+
+    while (this.elapsedMs >= this.checkIntervalMs) {
+      this.elapsedMs -= this.checkIntervalMs;
+
+      const checkMinutes = this.checkIntervalMs * this.gameMinutesPerRealMs;
+      if (this.evaluateCondos(checkMinutes)) {
+        changedMap = true;
+      }
+    }
+
+    return changedMap;
+  }
+
+  private evaluateCondos(checkMinutes: number): boolean {
+    const offices: Array<{ x: number; y: number; influence: Influence }> = [];
+
+    for (const officeEntity of this.world.query('position', 'floor', 'influence')) {
+      const position = this.world.getComponent(officeEntity, 'position');
+      const floor = this.world.getComponent(officeEntity, 'floor');
+      const influence = this.world.getComponent(officeEntity, 'influence');
+
+      if (!position || !floor || !influence || floor.zone !== 'OFFICE' || !floor.occupied) {
+        continue;
+      }
+
+      offices.push({
+        x: position.x,
+        y: position.y,
+        influence,
+      });
+    }
+
+    let changedMap = false;
+
+    for (const condoEntity of this.world.query('position', 'floor', 'condo')) {
+      const position = this.world.getComponent(condoEntity, 'position');
+      const floor = this.world.getComponent(condoEntity, 'floor');
+      const condo = this.world.getComponent(condoEntity, 'condo');
+
+      if (!position || !floor || !condo || floor.zone !== 'CONDO' || !condo.occupied) {
+        continue;
+      }
+
+      let noiseTotal = 0;
+
+      for (const office of offices) {
+        const manhattanDistance = Math.abs(position.x - office.x) + Math.abs(position.y - office.y);
+        if (manhattanDistance <= office.influence.noiseRadius) {
+          noiseTotal += office.influence.noiseIntensity;
+        }
+      }
+
+      if (noiseTotal > condo.noiseSensitivity) {
+        condo.warningActive = true;
+        condo.warningMinutes += checkMinutes;
+
+        if (condo.warningMinutes > 24 * 60) {
+          condo.warningActive = false;
+          condo.warningMinutes = 0;
+          condo.occupied = false;
+          floor.occupied = false;
+          floor.rent = 0;
+          changedMap = true;
+        }
+      } else {
+        condo.warningActive = false;
+        condo.warningMinutes = 0;
+      }
+    }
+
+    return changedMap;
   }
 }
 

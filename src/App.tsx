@@ -3,7 +3,14 @@ import { GameCanvas } from './components/GameCanvas';
 import { formatGameTime, gameStateStore } from './engine/Core/Game';
 import { Tool, TOOL_COSTS, TOOL_LABELS } from './engine/Core/Tools';
 
-const TOOL_ORDER: Tool[] = [Tool.FLOOR, Tool.ELEVATOR, Tool.DELETE];
+const TOOL_ORDER: Tool[] = [
+  Tool.FLOOR,
+  Tool.OFFICE,
+  Tool.CONDO,
+  Tool.FOOD_COURT,
+  Tool.ELEVATOR,
+  Tool.DELETE,
+];
 
 function App() {
   const [selectedTool, setSelectedTool] = useState<Tool>(Tool.FLOOR);
@@ -43,7 +50,7 @@ function App() {
           })}
 
           <p className="ml-2 text-xs text-slate-400">
-            Left click builds/deletes. Right click a floor to dispatch an agent.
+            Drag with Floor to lay segments ($10 each). Rooms require floor support. Right click sends an agent.
           </p>
         </section>
 
@@ -59,6 +66,11 @@ function App() {
               <p className="text-sm text-slate-300">
                 Time: {formatGameTime(gameState.elapsedMinutes)}
               </p>
+              {gameState.statusMessage ? (
+                <p className="mt-1 text-sm font-medium text-rose-300">
+                  {gameState.statusMessage}
+                </p>
+              ) : null}
             </section>
           </div>
         </div>

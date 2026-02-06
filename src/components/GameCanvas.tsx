@@ -54,21 +54,40 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
     }
 
     const pointer = getScaledPointerPosition(event);
-    game.setPointerPosition(pointer.x, pointer.y);
+    game.updatePrimaryDrag(pointer.x, pointer.y);
   };
 
   const handlePointerLeave = (): void => {
     gameRef.current?.clearPointer();
+    gameRef.current?.cancelPrimaryAction();
   };
 
-  const handlePointerClick = (event: MouseEvent<HTMLCanvasElement>): void => {
+  const handlePointerDown = (event: MouseEvent<HTMLCanvasElement>): void => {
+    if (event.button !== 0) {
+      return;
+    }
+
     const game = gameRef.current;
     if (!game) {
       return;
     }
 
     const pointer = getScaledPointerPosition(event);
-    game.handlePrimaryClick(pointer.x, pointer.y);
+    game.beginPrimaryAction(pointer.x, pointer.y);
+  };
+
+  const handlePointerUp = (event: MouseEvent<HTMLCanvasElement>): void => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const game = gameRef.current;
+    if (!game) {
+      return;
+    }
+
+    const pointer = getScaledPointerPosition(event);
+    game.endPrimaryAction(pointer.x, pointer.y);
   };
 
   const handleContextMenu = (event: MouseEvent<HTMLCanvasElement>): void => {
@@ -102,7 +121,8 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
         aria-label="Simulation Layer"
         onMouseMove={handlePointerMove}
         onMouseLeave={handlePointerLeave}
-        onClick={handlePointerClick}
+        onMouseDown={handlePointerDown}
+        onMouseUp={handlePointerUp}
         onContextMenu={handleContextMenu}
       />
     </div>
