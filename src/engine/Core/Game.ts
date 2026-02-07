@@ -22,9 +22,43 @@ const GRID_ROWS = 20;
 const GROUND_ROW = GRID_ROWS - 2;
 
 const STARTING_FUNDS = 100000;
+const ROOM_SPRITE_SHEET_PATH: string | null = '/room-spritesheet.png';
 const OFFICE_TEXTURE_PATH: string | null = '/office.jpg';
 const OFFICE_ACTIVE_TEXTURE_PATH: string | null = '/office_active.jpg';
 const OFFICE_WIDE_TEXTURE_PATH: string | null = '/office_wide.png';
+const CONDO_WIDE_TEXTURE_PATH: string | null = '/condo_wide.png';
+
+type RoomSpriteFrameId =
+  | 'office_single'
+  | 'office_active_single'
+  | 'office_wide'
+  | 'office_active_wide'
+  | 'condo_single'
+  | 'condo_wide'
+  | 'food_court_single'
+  | 'food_court_wide'
+  | 'food_court_triple';
+
+interface RoomSpriteFrame {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  tilesWide: number;
+}
+
+// Update these frame coordinates to match your atlas layout.
+const ROOM_SPRITE_FRAMES: Record<RoomSpriteFrameId, RoomSpriteFrame> = {
+  office_single: { sx: 213, sy: 213, sw: 160, sh: 160, tilesWide: 1 },
+  office_active_single: { sx: 64, sy: 0, sw: 64, sh: 64, tilesWide: 1 },
+  office_wide: { sx: 128, sy: 0, sw: 128, sh: 64, tilesWide: 2 },
+  office_active_wide: { sx: 256, sy: 0, sw: 128, sh: 64, tilesWide: 2 },
+  condo_single: { sx: 776, sy: 215, sw: 160, sh: 160, tilesWide: 1 },
+  condo_wide: { sx: 64, sy: 64, sw: 128, sh: 64, tilesWide: 2 },
+  food_court_single: { sx: 0, sy: 128, sw: 64, sh: 64, tilesWide: 1 },
+  food_court_wide: { sx: 64, sy: 128, sw: 128, sh: 64, tilesWide: 2 },
+  food_court_triple: { sx: 192, sy: 128, sw: 192, sh: 64, tilesWide: 3 },
+};
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -44,6 +78,9 @@ export type InspectableRoomZone = 'OFFICE' | 'CONDO' | 'FOOD_COURT';
 
 export interface RoomInspection {
   roomId: number;
+  roomIdSource: 'ROOM_ID' | 'ANCHOR';
+  anchorX: number;
+  anchorY: number;
   zone: InspectableRoomZone;
   tileCount: number;
   totalRent: number;
@@ -132,6 +169,9 @@ export class Game {
 
   private selectedTool: Tool | null = Tool.FLOOR;
   private worldLayerDirty = true;
+  private roomSpriteSheet: HTMLImageElement | null = null;
+  private roomSpriteSheetLoaded = false;
+  private roomSpriteSheetPath: string | null = null;
   private officeTexture: HTMLImageElement | null = null;
   private officeTextureLoaded = false;
   private officeTexturePath: string | null = null;
@@ -141,6 +181,9 @@ export class Game {
   private officeWideTexture: HTMLImageElement | null = null;
   private officeWideTextureLoaded = false;
   private officeWideTexturePath: string | null = null;
+  private condoWideTexture: HTMLImageElement | null = null;
+  private condoWideTextureLoaded = false;
+  private condoWideTexturePath: string | null = null;
   private activeOfficeTiles = new Set<string>();
 
   private lastProcessedGameMinute = 0;
@@ -176,9 +219,11 @@ export class Game {
       this.renderFrame();
     });
 
+    this.setRoomSpriteSheetPath(ROOM_SPRITE_SHEET_PATH);
     this.setOfficeTexturePath(OFFICE_TEXTURE_PATH);
     this.setOfficeActiveTexturePath(OFFICE_ACTIVE_TEXTURE_PATH);
     this.setOfficeWideTexturePath(OFFICE_WIDE_TEXTURE_PATH);
+    this.setCondoWideTexturePath(CONDO_WIDE_TEXTURE_PATH);
   }
 
   public start(): void {
@@ -208,6 +253,46 @@ export class Game {
 
   public setTool(tool: Tool | null): void {
     this.selectedTool = tool;
+  }
+
+  public setRoomSpriteSheetPath(path: string | null): void {
+    const trimmed = path?.trim() ?? '';
+    if (!trimmed) {
+      this.roomSpriteSheetPath = null;
+    } else if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:')
+    ) {
+      this.roomSpriteSheetPath = trimmed;
+    } else {
+      this.roomSpriteSheetPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    }
+
+    this.roomSpriteSheet = null;
+    this.roomSpriteSheetLoaded = false;
+
+    if (!this.roomSpriteSheetPath) {
+      this.worldLayerDirty = true;
+      return;
+    }
+
+    const requestedPath = this.roomSpriteSheetPath;
+    const image = new Image();
+    image.onload = () => {
+      if (this.roomSpriteSheetPath !== requestedPath) {
+        return;
+      }
+      this.roomSpriteSheet = image;
+      this.roomSpriteSheetLoaded = true;
+      this.worldLayerDirty = true;
+    };
+    image.onerror = () => {
+      this.roomSpriteSheet = null;
+      this.roomSpriteSheetLoaded = false;
+      this.worldLayerDirty = true;
+    };
+    image.src = this.roomSpriteSheetPath;
   }
 
   public setOfficeTexturePath(path: string | null): void {
@@ -330,6 +415,46 @@ export class Game {
     image.src = this.officeWideTexturePath;
   }
 
+  public setCondoWideTexturePath(path: string | null): void {
+    const trimmed = path?.trim() ?? '';
+    if (!trimmed) {
+      this.condoWideTexturePath = null;
+    } else if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:')
+    ) {
+      this.condoWideTexturePath = trimmed;
+    } else {
+      this.condoWideTexturePath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    }
+
+    this.condoWideTexture = null;
+    this.condoWideTextureLoaded = false;
+
+    if (!this.condoWideTexturePath) {
+      this.worldLayerDirty = true;
+      return;
+    }
+
+    const requestedPath = this.condoWideTexturePath;
+    const image = new Image();
+    image.onload = () => {
+      if (this.condoWideTexturePath !== requestedPath) {
+        return;
+      }
+      this.condoWideTexture = image;
+      this.condoWideTextureLoaded = true;
+      this.worldLayerDirty = true;
+    };
+    image.onerror = () => {
+      this.condoWideTexture = null;
+      this.condoWideTextureLoaded = false;
+      this.worldLayerDirty = true;
+    };
+    image.src = this.condoWideTexturePath;
+  }
+
   public setPointerPosition(pixelX: number, pixelY: number): void {
     this.mouseSystem.setHoveredCell(this.grid.screenToGrid(pixelX, pixelY));
   }
@@ -406,6 +531,7 @@ export class Game {
     this.setPointerPosition(pixelX, pixelY);
 
     if (this.selectedTool === null) {
+      this.handleInspectDoubleClick(pixelX, pixelY);
       this.setStatus(null);
       return;
     }
@@ -1301,45 +1427,47 @@ export class Game {
 
   private buildRoomInspectionAtCell(cell: GridCell): RoomInspection | null {
     const floor = this.getFloorAt(cell.x, cell.y);
-    if (!floor || !floor.occupied || floor.roomId === null || !this.isInspectableZone(floor.zone)) {
+    if (!floor || !floor.occupied || !this.isInspectableZone(floor.zone)) {
       return null;
+    }
+
+    if (floor.roomId === null) {
+      return this.buildRoomInspectionFromAnchor(cell, floor.zone);
     }
 
     return this.buildRoomInspectionById(floor.roomId);
   }
 
   private buildRoomInspectionById(roomId: number): RoomInspection | null {
-    let zone: InspectableRoomZone | null = null;
-    const tiles: GridCell[] = [];
-    let totalRent = 0;
-
-    for (const floorEntity of this.world.query('position', 'floor')) {
-      const position = this.world.getComponent(floorEntity, 'position');
-      const floor = this.world.getComponent(floorEntity, 'floor');
-      if (!position || !floor) {
-        continue;
-      }
-
-      if (floor.roomId !== roomId || !floor.occupied || !this.isInspectableZone(floor.zone)) {
-        continue;
-      }
-
-      if (zone === null) {
-        zone = floor.zone;
-      }
-
-      if (floor.zone !== zone) {
-        continue;
-      }
-
-      tiles.push({ x: position.x, y: position.y });
-      totalRent += floor.rent;
-    }
-
-    if (!zone || tiles.length === 0) {
+    const roomTiles = this.getRoomTilesByRoomId(roomId);
+    if (!roomTiles) {
       return null;
     }
 
+    return this.buildRoomInspection(roomTiles.zone, roomTiles.tiles, roomTiles.totalRent, roomId, 'ROOM_ID');
+  }
+
+  private buildRoomInspectionFromAnchor(
+    anchor: GridCell,
+    zone: InspectableRoomZone,
+  ): RoomInspection | null {
+    const cluster = this.getConnectedRoomTiles(anchor, zone);
+    if (cluster.tiles.length === 0) {
+      return null;
+    }
+
+    const syntheticRoomId = this.syntheticRoomId(anchor, zone);
+    return this.buildRoomInspection(zone, cluster.tiles, cluster.totalRent, syntheticRoomId, 'ANCHOR');
+  }
+
+  private buildRoomInspection(
+    zone: InspectableRoomZone,
+    tiles: GridCell[],
+    totalRent: number,
+    roomId: number,
+    roomIdSource: 'ROOM_ID' | 'ANCHOR',
+  ): RoomInspection {
+    const anchor = this.pickAnchorTile(tiles);
     const tileKeys = new Set(tiles.map((tile) => this.cellKey(tile.x, tile.y)));
     let occupancyCount = 0;
     let assignedCount = 0;
@@ -1386,6 +1514,9 @@ export class Game {
 
     return {
       roomId,
+      roomIdSource,
+      anchorX: anchor.x,
+      anchorY: anchor.y,
       zone,
       tileCount: tiles.length,
       totalRent,
@@ -1403,7 +1534,13 @@ export class Game {
       return;
     }
 
-    const refreshed = this.buildRoomInspectionById(currentInspection.roomId);
+    const refreshed =
+      currentInspection.roomIdSource === 'ROOM_ID'
+        ? this.buildRoomInspectionById(currentInspection.roomId)
+        : this.buildRoomInspectionAtCell({
+            x: currentInspection.anchorX,
+            y: currentInspection.anchorY,
+          });
     if (!this.isRoomInspectionEqual(currentInspection, refreshed)) {
       gameStateStore.setState({ inspectedRoom: refreshed });
     }
@@ -1478,6 +1615,10 @@ export class Game {
 
       const tile = this.grid.gridToScreen(position.x, position.y);
 
+      if (this.tryDrawRoomSpriteFromSheet(position.x, position.y, floor, tile.x, tile.y)) {
+        continue;
+      }
+
       const zoneColor =
         floor.zone === 'HALLWAY'
           ? '#6b7280'
@@ -1499,6 +1640,41 @@ export class Game {
             : floor.zone === 'CONDO'
               ? '#99f6e4'
               : '#fde68a';
+
+      if (floor.zone === 'CONDO' && floor.occupied) {
+        const span = floor.condoSpan ?? 'SINGLE';
+        if (span === 'RIGHT') {
+          const leftFloor = this.getFloorAt(position.x - 1, position.y);
+          if (
+            leftFloor &&
+            leftFloor.occupied &&
+            leftFloor.zone === 'CONDO' &&
+            leftFloor.condoSpan === 'LEFT'
+          ) {
+            continue;
+          }
+        }
+
+        if (span === 'LEFT' && this.condoWideTextureLoaded && this.condoWideTexture) {
+          const rightFloor = this.getFloorAt(position.x + 1, position.y);
+          const isValidWidePair =
+            rightFloor !== null &&
+            rightFloor.occupied &&
+            rightFloor.zone === 'CONDO' &&
+            rightFloor.condoSpan === 'RIGHT';
+
+          if (isValidWidePair) {
+            this.worldContext.drawImage(
+              this.condoWideTexture,
+              tile.x,
+              tile.y,
+              this.grid.cellSize * 2,
+              this.grid.cellSize,
+            );
+            continue;
+          }
+        }
+      }
 
       if (floor.zone === 'OFFICE' && floor.occupied) {
         const span = floor.officeSpan ?? 'SINGLE';
@@ -1582,6 +1758,102 @@ export class Game {
     }
   }
 
+  private tryDrawRoomSpriteFromSheet(
+    tileX: number,
+    tileY: number,
+    floor: Floor,
+    pixelX: number,
+    pixelY: number,
+  ): boolean {
+    if (!this.roomSpriteSheetLoaded || !this.roomSpriteSheet || !floor.occupied) {
+      return false;
+    }
+
+    if (floor.zone === 'OFFICE') {
+      const span = floor.officeSpan ?? 'SINGLE';
+
+      if (
+        span === 'RIGHT' &&
+        this.hasMatchingRoomTile(tileX - 1, tileY, 'OFFICE', floor.roomId, 'LEFT', 'office')
+      ) {
+        return true;
+      }
+
+      const isActive = this.activeOfficeTiles.has(this.cellKey(tileX, tileY));
+
+      if (
+        span === 'LEFT' &&
+        this.hasMatchingRoomTile(tileX + 1, tileY, 'OFFICE', floor.roomId, 'RIGHT', 'office')
+      ) {
+        const isRightActive = this.activeOfficeTiles.has(this.cellKey(tileX + 1, tileY));
+        const frameId: RoomSpriteFrameId =
+          isActive || isRightActive ? 'office_active_wide' : 'office_wide';
+        return this.drawRoomSpriteFrame(frameId, pixelX, pixelY);
+      }
+
+      return this.drawRoomSpriteFrame(isActive ? 'office_active_single' : 'office_single', pixelX, pixelY);
+    }
+
+    if (floor.zone === 'CONDO') {
+      const span = floor.condoSpan ?? 'SINGLE';
+
+      if (
+        span === 'RIGHT' &&
+        this.hasMatchingRoomTile(tileX - 1, tileY, 'CONDO', floor.roomId, 'LEFT', 'condo')
+      ) {
+        return true;
+      }
+
+      if (
+        span === 'LEFT' &&
+        this.hasMatchingRoomTile(tileX + 1, tileY, 'CONDO', floor.roomId, 'RIGHT', 'condo')
+      ) {
+        return this.drawRoomSpriteFrame('condo_wide', pixelX, pixelY);
+      }
+
+      return this.drawRoomSpriteFrame('condo_single', pixelX, pixelY);
+    }
+
+    if (floor.zone === 'FOOD_COURT') {
+      const roomId = floor.roomId;
+      if (roomId !== null && this.hasMatchingRoomTile(tileX - 1, tileY, 'FOOD_COURT', roomId, null, null)) {
+        return true;
+      }
+
+      const width =
+        roomId !== null ? this.measureRoomWidth(tileX, tileY, 'FOOD_COURT', roomId, 3) : 1;
+      const frameId: RoomSpriteFrameId =
+        width >= 3 ? 'food_court_triple' : width === 2 ? 'food_court_wide' : 'food_court_single';
+      return this.drawRoomSpriteFrame(frameId, pixelX, pixelY);
+    }
+
+    return false;
+  }
+
+  private drawRoomSpriteFrame(frameId: RoomSpriteFrameId, pixelX: number, pixelY: number): boolean {
+    if (!this.roomSpriteSheetLoaded || !this.roomSpriteSheet) {
+      return false;
+    }
+
+    const frame = ROOM_SPRITE_FRAMES[frameId];
+    if (!frame) {
+      return false;
+    }
+
+    this.worldContext.drawImage(
+      this.roomSpriteSheet,
+      frame.sx,
+      frame.sy,
+      frame.sw,
+      frame.sh,
+      pixelX,
+      pixelY,
+      this.grid.cellSize * frame.tilesWide,
+      this.grid.cellSize,
+    );
+    return true;
+  }
+
   private refreshOfficeOccupancy(): void {
     const officeTiles = new Set<string>();
     for (const floorEntity of this.world.query('position', 'floor')) {
@@ -1640,6 +1912,147 @@ export class Game {
     return null;
   }
 
+  private hasMatchingRoomTile(
+    x: number,
+    y: number,
+    zone: RoomZone,
+    roomId: number | null,
+    expectedSpan: 'LEFT' | 'RIGHT' | null,
+    spanKind: 'office' | 'condo' | null,
+  ): boolean {
+    const floor = this.getFloorAt(x, y);
+    if (!floor || !floor.occupied || floor.zone !== zone) {
+      return false;
+    }
+
+    if (roomId !== null && floor.roomId !== roomId) {
+      return false;
+    }
+
+    if (expectedSpan && spanKind === 'office' && floor.officeSpan !== expectedSpan) {
+      return false;
+    }
+
+    if (expectedSpan && spanKind === 'condo' && floor.condoSpan !== expectedSpan) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private measureRoomWidth(
+    x: number,
+    y: number,
+    zone: RoomZone,
+    roomId: number,
+    maxWidth: number,
+  ): number {
+    let width = 0;
+
+    for (let offset = 0; offset < maxWidth; offset += 1) {
+      const floor = this.getFloorAt(x + offset, y);
+      if (!floor || !floor.occupied || floor.zone !== zone || floor.roomId !== roomId) {
+        break;
+      }
+
+      width += 1;
+    }
+
+    return Math.max(1, width);
+  }
+
+  private getRoomTilesByRoomId(
+    roomId: number,
+  ): { zone: InspectableRoomZone; tiles: GridCell[]; totalRent: number } | null {
+    let zone: InspectableRoomZone | null = null;
+    const tiles: GridCell[] = [];
+    let totalRent = 0;
+
+    for (const floorEntity of this.world.query('position', 'floor')) {
+      const position = this.world.getComponent(floorEntity, 'position');
+      const floor = this.world.getComponent(floorEntity, 'floor');
+      if (!position || !floor) {
+        continue;
+      }
+
+      if (floor.roomId !== roomId || !floor.occupied || !this.isInspectableZone(floor.zone)) {
+        continue;
+      }
+
+      if (zone === null) {
+        zone = floor.zone;
+      }
+
+      if (floor.zone !== zone) {
+        continue;
+      }
+
+      tiles.push({ x: position.x, y: position.y });
+      totalRent += floor.rent;
+    }
+
+    if (!zone || tiles.length === 0) {
+      return null;
+    }
+
+    return { zone, tiles, totalRent };
+  }
+
+  private getConnectedRoomTiles(
+    anchor: GridCell,
+    zone: InspectableRoomZone,
+  ): { tiles: GridCell[]; totalRent: number } {
+    const queue: GridCell[] = [anchor];
+    const visited = new Set<string>();
+    const tiles: GridCell[] = [];
+    let totalRent = 0;
+
+    while (queue.length > 0) {
+      const cell = queue.shift();
+      if (!cell) {
+        continue;
+      }
+
+      const key = this.cellKey(cell.x, cell.y);
+      if (visited.has(key)) {
+        continue;
+      }
+      visited.add(key);
+
+      const floor = this.getFloorAt(cell.x, cell.y);
+      if (!floor || !floor.occupied || floor.zone !== zone) {
+        continue;
+      }
+
+      tiles.push(cell);
+      totalRent += floor.rent;
+
+      queue.push({ x: cell.x - 1, y: cell.y });
+      queue.push({ x: cell.x + 1, y: cell.y });
+      queue.push({ x: cell.x, y: cell.y - 1 });
+      queue.push({ x: cell.x, y: cell.y + 1 });
+    }
+
+    return { tiles, totalRent };
+  }
+
+  private pickAnchorTile(tiles: GridCell[]): GridCell {
+    let anchor = tiles[0] ?? { x: 0, y: 0 };
+
+    for (const tile of tiles) {
+      if (tile.y < anchor.y || (tile.y === anchor.y && tile.x < anchor.x)) {
+        anchor = tile;
+      }
+    }
+
+    return anchor;
+  }
+
+  private syntheticRoomId(anchor: GridCell, zone: InspectableRoomZone): number {
+    const zoneSalt = zone === 'OFFICE' ? 1 : zone === 'CONDO' ? 2 : 3;
+    return 1_000_000 + zoneSalt * 100_000 + anchor.y * 1_000 + anchor.x;
+  }
+
   private isRoomInspectionEqual(a: RoomInspection | null, b: RoomInspection | null): boolean {
     if (!a || !b) {
       return a === b;
@@ -1647,6 +2060,9 @@ export class Game {
 
     return (
       a.roomId === b.roomId &&
+      a.roomIdSource === b.roomIdSource &&
+      a.anchorX === b.anchorX &&
+      a.anchorY === b.anchorY &&
       a.zone === b.zone &&
       a.tileCount === b.tileCount &&
       a.totalRent === b.totalRent &&

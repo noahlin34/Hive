@@ -98,6 +98,7 @@ export interface Floor {
   rent: number;
   windowSeed: number;
   officeSpan: OfficeSpan | null;
+  condoSpan: OfficeSpan | null;
   roomId: number | null;
 }
 
@@ -831,6 +832,14 @@ export class MouseSystem {
               : 'RIGHT'
             : 'SINGLE'
           : null;
+      floor.condoSpan =
+        floor.zone === 'CONDO'
+          ? footprint.length >= 2
+            ? index === 0
+              ? 'LEFT'
+              : 'RIGHT'
+            : 'SINGLE'
+          : null;
       floor.roomId = roomId;
 
       if (floor.zone === 'OFFICE') {
@@ -905,6 +914,10 @@ export class MouseSystem {
       return this.getOfficeFootprint(anchor);
     }
 
+    if (tool === Tool.CONDO) {
+      return this.getCondoFootprint(anchor);
+    }
+
     const width = tool === Tool.FOOD_COURT ? 3 : 2;
     const footprint: GridCell[] = [];
 
@@ -925,7 +938,31 @@ export class MouseSystem {
     return [anchor];
   }
 
+  private getCondoFootprint(anchor: GridCell): GridCell[] {
+    const nextCell = { x: anchor.x + 1, y: anchor.y };
+
+    if (this.canCondoTileSupport(anchor) && this.canCondoTileSupport(nextCell)) {
+      return [anchor, nextCell];
+    }
+
+    return [anchor];
+  }
+
   private canOfficeTileSupport(cell: GridCell): boolean {
+    const floorEntity = this.getEntityByTypeAt(cell, 'floor');
+    if (floorEntity === null) {
+      return false;
+    }
+
+    const floor = this.world.getComponent(floorEntity, 'floor');
+    if (!floor) {
+      return false;
+    }
+
+    return floor.zone === 'HALLWAY' || floor.zone === 'LOBBY';
+  }
+
+  private canCondoTileSupport(cell: GridCell): boolean {
     const floorEntity = this.getEntityByTypeAt(cell, 'floor');
     if (floorEntity === null) {
       return false;
@@ -949,6 +986,7 @@ export class MouseSystem {
       rent: 0,
       windowSeed: Math.floor(pseudoRandom(entity + cell.x * 17 + cell.y * 31) * 10000),
       officeSpan: null,
+      condoSpan: null,
       roomId: null,
     });
   }

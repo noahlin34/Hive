@@ -12,6 +12,9 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
   const simulationCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const gameRef = useRef<Game | null>(null);
   const pendingPrimaryActionRef = useRef<number | null>(null);
+  const lastPrimaryClickRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  const DOUBLE_CLICK_WINDOW_MS = 320;
+  const DOUBLE_CLICK_MAX_DISTANCE_PX = 18;
 
   useEffect(() => {
     const worldCanvas = worldCanvasRef.current;
@@ -30,6 +33,7 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
         window.clearTimeout(pendingPrimaryActionRef.current);
         pendingPrimaryActionRef.current = null;
       }
+      lastPrimaryClickRef.current = null;
       game.dispose();
       gameRef.current = null;
     };
@@ -67,16 +71,13 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
       window.clearTimeout(pendingPrimaryActionRef.current);
       pendingPrimaryActionRef.current = null;
     }
+    lastPrimaryClickRef.current = null;
     gameRef.current?.clearPointer();
     gameRef.current?.cancelPrimaryAction();
   };
 
   const handlePointerDown = (event: MouseEvent<HTMLCanvasElement>): void => {
     if (event.button !== 0) {
-      return;
-    }
-
-    if (event.detail >= 2) {
       return;
     }
 
@@ -105,16 +106,28 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
       pendingPrimaryActionRef.current = null;
     }
 
-    if (event.detail >= 2) {
+    const now = performance.now();
+    const lastClick = lastPrimaryClickRef.current;
+    const dx = lastClick ? pointer.x - lastClick.x : 0;
+    const dy = lastClick ? pointer.y - lastClick.y : 0;
+    const withinDistance =
+      dx * dx + dy * dy <= DOUBLE_CLICK_MAX_DISTANCE_PX * DOUBLE_CLICK_MAX_DISTANCE_PX;
+    const isDoubleClick =
+      Boolean(lastClick) && now - (lastClick?.time ?? 0) <= DOUBLE_CLICK_WINDOW_MS && withinDistance;
+
+    if (isDoubleClick) {
       game.cancelPrimaryAction();
       game.handleInspectDoubleClick(pointer.x, pointer.y);
+      lastPrimaryClickRef.current = null;
       return;
     }
 
+    lastPrimaryClickRef.current = { time: now, x: pointer.x, y: pointer.y };
     pendingPrimaryActionRef.current = window.setTimeout(() => {
       game.endPrimaryAction(pointer.x, pointer.y);
       pendingPrimaryActionRef.current = null;
-    }, 220);
+      lastPrimaryClickRef.current = null;
+    }, DOUBLE_CLICK_WINDOW_MS);
   };
 
   const handleContextMenu = (event: MouseEvent<HTMLCanvasElement>): void => {
@@ -127,22 +140,6 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
 
     const pointer = getScaledPointerPosition(event);
     game.handleCommandClick(pointer.x, pointer.y);
-  };
-
-  const handleDoubleClick = (event: MouseEvent<HTMLCanvasElement>): void => {
-    const game = gameRef.current;
-    if (!game) {
-      return;
-    }
-
-    if (pendingPrimaryActionRef.current !== null) {
-      window.clearTimeout(pendingPrimaryActionRef.current);
-      pendingPrimaryActionRef.current = null;
-    }
-
-    const pointer = getScaledPointerPosition(event);
-    game.cancelPrimaryAction();
-    game.handleInspectDoubleClick(pointer.x, pointer.y);
   };
 
   return (
@@ -167,7 +164,6 @@ export function GameCanvas({ selectedTool }: GameCanvasProps) {
         onMouseDown={handlePointerDown}
         onMouseUp={handlePointerUp}
         onContextMenu={handleContextMenu}
-        onDoubleClick={handleDoubleClick}
       />
     </div>
   );

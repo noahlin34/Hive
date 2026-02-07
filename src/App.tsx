@@ -84,7 +84,10 @@ function App() {
               <section className="pointer-events-none absolute right-4 top-4 rounded-md border border-slate-600/60 bg-slate-900/88 px-4 py-3 shadow-xl backdrop-blur-sm">
                 <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Room Inspector</p>
                 <p className="text-sm font-semibold">
-                  {roomZoneLabel(gameState.inspectedRoom.zone)} #{gameState.inspectedRoom.roomId}
+                  {roomZoneLabel(gameState.inspectedRoom.zone)}
+                  {gameState.inspectedRoom.roomIdSource === 'ROOM_ID'
+                    ? ` #${gameState.inspectedRoom.roomId}`
+                    : ' (legacy)'}
                 </p>
                 <p className="text-sm text-slate-200">
                   Rent: ${gameState.inspectedRoom.totalRent.toLocaleString()} / day
