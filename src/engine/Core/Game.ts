@@ -2,6 +2,7 @@ import {
   AgentSystem,
   type Agent,
   type AgentArchetype,
+  createPersonAgent,
   type EntityId,
   ECSWorld,
   ElevatorSystem,
@@ -22,43 +23,10 @@ const GRID_ROWS = 20;
 const GROUND_ROW = GRID_ROWS - 2;
 
 const STARTING_FUNDS = 100000;
-const ROOM_SPRITE_SHEET_PATH: string | null = '/room-spritesheet.png';
-const OFFICE_TEXTURE_PATH: string | null = '/office.jpg';
+const OFFICE_TEXTURE_PATH: string | null = '/office.png';
 const OFFICE_ACTIVE_TEXTURE_PATH: string | null = '/office_active.jpg';
 const OFFICE_WIDE_TEXTURE_PATH: string | null = '/office_wide.png';
 const CONDO_WIDE_TEXTURE_PATH: string | null = '/condo_wide.png';
-
-type RoomSpriteFrameId =
-  | 'office_single'
-  | 'office_active_single'
-  | 'office_wide'
-  | 'office_active_wide'
-  | 'condo_single'
-  | 'condo_wide'
-  | 'food_court_single'
-  | 'food_court_wide'
-  | 'food_court_triple';
-
-interface RoomSpriteFrame {
-  sx: number;
-  sy: number;
-  sw: number;
-  sh: number;
-  tilesWide: number;
-}
-
-// Update these frame coordinates to match your atlas layout.
-const ROOM_SPRITE_FRAMES: Record<RoomSpriteFrameId, RoomSpriteFrame> = {
-  office_single: { sx: 213, sy: 213, sw: 160, sh: 160, tilesWide: 1 },
-  office_active_single: { sx: 64, sy: 0, sw: 64, sh: 64, tilesWide: 1 },
-  office_wide: { sx: 128, sy: 0, sw: 128, sh: 64, tilesWide: 2 },
-  office_active_wide: { sx: 256, sy: 0, sw: 128, sh: 64, tilesWide: 2 },
-  condo_single: { sx: 776, sy: 215, sw: 160, sh: 160, tilesWide: 1 },
-  condo_wide: { sx: 64, sy: 64, sw: 128, sh: 64, tilesWide: 2 },
-  food_court_single: { sx: 0, sy: 128, sw: 64, sh: 64, tilesWide: 1 },
-  food_court_wide: { sx: 64, sy: 128, sw: 128, sh: 64, tilesWide: 2 },
-  food_court_triple: { sx: 192, sy: 128, sw: 192, sh: 64, tilesWide: 3 },
-};
 
 const GAME_HOUR_REAL_MS = 2000;
 const GAME_MINUTES_PER_REAL_MS = 60 / GAME_HOUR_REAL_MS;
@@ -169,9 +137,6 @@ export class Game {
 
   private selectedTool: Tool | null = Tool.FLOOR;
   private worldLayerDirty = true;
-  private roomSpriteSheet: HTMLImageElement | null = null;
-  private roomSpriteSheetLoaded = false;
-  private roomSpriteSheetPath: string | null = null;
   private officeTexture: HTMLImageElement | null = null;
   private officeTextureLoaded = false;
   private officeTexturePath: string | null = null;
@@ -219,7 +184,6 @@ export class Game {
       this.renderFrame();
     });
 
-    this.setRoomSpriteSheetPath(ROOM_SPRITE_SHEET_PATH);
     this.setOfficeTexturePath(OFFICE_TEXTURE_PATH);
     this.setOfficeActiveTexturePath(OFFICE_ACTIVE_TEXTURE_PATH);
     this.setOfficeWideTexturePath(OFFICE_WIDE_TEXTURE_PATH);
@@ -253,46 +217,6 @@ export class Game {
 
   public setTool(tool: Tool | null): void {
     this.selectedTool = tool;
-  }
-
-  public setRoomSpriteSheetPath(path: string | null): void {
-    const trimmed = path?.trim() ?? '';
-    if (!trimmed) {
-      this.roomSpriteSheetPath = null;
-    } else if (
-      trimmed.startsWith('http://') ||
-      trimmed.startsWith('https://') ||
-      trimmed.startsWith('data:')
-    ) {
-      this.roomSpriteSheetPath = trimmed;
-    } else {
-      this.roomSpriteSheetPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-    }
-
-    this.roomSpriteSheet = null;
-    this.roomSpriteSheetLoaded = false;
-
-    if (!this.roomSpriteSheetPath) {
-      this.worldLayerDirty = true;
-      return;
-    }
-
-    const requestedPath = this.roomSpriteSheetPath;
-    const image = new Image();
-    image.onload = () => {
-      if (this.roomSpriteSheetPath !== requestedPath) {
-        return;
-      }
-      this.roomSpriteSheet = image;
-      this.roomSpriteSheetLoaded = true;
-      this.worldLayerDirty = true;
-    };
-    image.onerror = () => {
-      this.roomSpriteSheet = null;
-      this.roomSpriteSheetLoaded = false;
-      this.worldLayerDirty = true;
-    };
-    image.src = this.roomSpriteSheetPath;
   }
 
   public setOfficeTexturePath(path: string | null): void {
@@ -1085,31 +1009,33 @@ export class Game {
     });
 
     this.world.addComponent(visitor, 'agent', {
-      name: `Visitor ${this.nextAgentId}`,
-      archetype: 'VISITOR',
-      routine: 'VISITING',
-      mood: 'neutral',
-      speed: 3.1,
-      phase: 'IDLE',
-      stress: 0,
-      waitMs: 0,
-      nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 20),
-      leaveByMinute: totalMinute + 60 + Math.floor(Math.random() * 180),
-      hasLunchedToday: false,
-      sourceFloorY: spawnCell.y,
-      targetFloorY: spawnCell.y,
-      targetX: spawnCell.x,
-      targetY: spawnCell.y,
-      homeX: null,
-      homeY: null,
-      workX: null,
-      workY: null,
-      desiredDirection: 'NONE',
-      assignedShaftX: null,
-      waitX: null,
-      assignedCarId: null,
-      callRegistered: false,
-      despawnOnArrival: false,
+      ...createPersonAgent('VISITOR', {
+        name: `Visitor ${this.nextAgentId}`,
+        archetype: 'VISITOR',
+        routine: 'VISITING',
+        mood: 'neutral',
+        speed: 3.1,
+        phase: 'IDLE',
+        stress: 0,
+        waitMs: 0,
+        nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 20),
+        leaveByMinute: totalMinute + 60 + Math.floor(Math.random() * 180),
+        hasLunchedToday: false,
+        sourceFloorY: spawnCell.y,
+        targetFloorY: spawnCell.y,
+        targetX: spawnCell.x,
+        targetY: spawnCell.y,
+        homeX: null,
+        homeY: null,
+        workX: null,
+        workY: null,
+        desiredDirection: 'NONE',
+        assignedShaftX: null,
+        waitX: null,
+        assignedCarId: null,
+        callRegistered: false,
+        despawnOnArrival: false,
+      }),
     });
 
     if (autoEnter && (entryCell.x !== spawnCell.x || entryCell.y !== spawnCell.y)) {
@@ -1144,31 +1070,33 @@ export class Game {
     });
 
     this.world.addComponent(resident, 'agent', {
-      name: `Resident ${this.nextAgentId}`,
-      archetype: 'RESIDENT',
-      routine: 'COMMUTING_HOME',
-      mood: 'neutral',
-      speed: 3,
-      phase: 'IDLE',
-      stress: 0,
-      waitMs: 0,
-      nextActionMinute: totalMinute + 15 + Math.floor(Math.random() * 35),
-      leaveByMinute: null,
-      hasLunchedToday: false,
-      sourceFloorY: spawnCell.y,
-      targetFloorY: spawnCell.y,
-      targetX: spawnCell.x,
-      targetY: spawnCell.y,
-      homeX: home.x,
-      homeY: home.y,
-      workX: null,
-      workY: null,
-      desiredDirection: 'NONE',
-      assignedShaftX: null,
-      waitX: null,
-      assignedCarId: null,
-      callRegistered: false,
-      despawnOnArrival: false,
+      ...createPersonAgent('RESIDENT', {
+        name: `Resident ${this.nextAgentId}`,
+        archetype: 'RESIDENT',
+        routine: 'COMMUTING_HOME',
+        mood: 'neutral',
+        speed: 3,
+        phase: 'IDLE',
+        stress: 0,
+        waitMs: 0,
+        nextActionMinute: totalMinute + 15 + Math.floor(Math.random() * 35),
+        leaveByMinute: null,
+        hasLunchedToday: false,
+        sourceFloorY: spawnCell.y,
+        targetFloorY: spawnCell.y,
+        targetX: spawnCell.x,
+        targetY: spawnCell.y,
+        homeX: home.x,
+        homeY: home.y,
+        workX: null,
+        workY: null,
+        desiredDirection: 'NONE',
+        assignedShaftX: null,
+        waitX: null,
+        assignedCarId: null,
+        callRegistered: false,
+        despawnOnArrival: false,
+      }),
     });
 
     const didEnter = this.agentSystem.issueTrip(resident, home, false);
@@ -1200,31 +1128,33 @@ export class Game {
     });
 
     this.world.addComponent(worker, 'agent', {
-      name: `Worker ${this.nextAgentId}`,
-      archetype: 'OFFICE_WORKER',
-      routine: 'COMMUTING_TO_WORK',
-      mood: 'neutral',
-      speed: 3.2,
-      phase: 'IDLE',
-      stress: 0,
-      waitMs: 0,
-      nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 12),
-      leaveByMinute: null,
-      hasLunchedToday: false,
-      sourceFloorY: spawnCell.y,
-      targetFloorY: spawnCell.y,
-      targetX: spawnCell.x,
-      targetY: spawnCell.y,
-      homeX: null,
-      homeY: null,
-      workX: officeDesk.x,
-      workY: officeDesk.y,
-      desiredDirection: 'NONE',
-      assignedShaftX: null,
-      waitX: null,
-      assignedCarId: null,
-      callRegistered: false,
-      despawnOnArrival: false,
+      ...createPersonAgent('OFFICE_WORKER', {
+        name: `Worker ${this.nextAgentId}`,
+        archetype: 'OFFICE_WORKER',
+        routine: 'COMMUTING_TO_WORK',
+        mood: 'neutral',
+        speed: 3.2,
+        phase: 'IDLE',
+        stress: 0,
+        waitMs: 0,
+        nextActionMinute: totalMinute + 10 + Math.floor(Math.random() * 12),
+        leaveByMinute: null,
+        hasLunchedToday: false,
+        sourceFloorY: spawnCell.y,
+        targetFloorY: spawnCell.y,
+        targetX: spawnCell.x,
+        targetY: spawnCell.y,
+        homeX: null,
+        homeY: null,
+        workX: officeDesk.x,
+        workY: officeDesk.y,
+        desiredDirection: 'NONE',
+        assignedShaftX: null,
+        waitX: null,
+        assignedCarId: null,
+        callRegistered: false,
+        despawnOnArrival: false,
+      }),
     });
 
     this.nextAgentId += 1;
@@ -1615,10 +1545,6 @@ export class Game {
 
       const tile = this.grid.gridToScreen(position.x, position.y);
 
-      if (this.tryDrawRoomSpriteFromSheet(position.x, position.y, floor, tile.x, tile.y)) {
-        continue;
-      }
-
       const zoneColor =
         floor.zone === 'HALLWAY'
           ? '#6b7280'
@@ -1758,112 +1684,23 @@ export class Game {
     }
   }
 
-  private tryDrawRoomSpriteFromSheet(
-    tileX: number,
-    tileY: number,
-    floor: Floor,
-    pixelX: number,
-    pixelY: number,
-  ): boolean {
-    if (!this.roomSpriteSheetLoaded || !this.roomSpriteSheet || !floor.occupied) {
-      return false;
-    }
-
-    if (floor.zone === 'OFFICE') {
-      const span = floor.officeSpan ?? 'SINGLE';
-
-      if (
-        span === 'RIGHT' &&
-        this.hasMatchingRoomTile(tileX - 1, tileY, 'OFFICE', floor.roomId, 'LEFT', 'office')
-      ) {
-        return true;
-      }
-
-      const isActive = this.activeOfficeTiles.has(this.cellKey(tileX, tileY));
-
-      if (
-        span === 'LEFT' &&
-        this.hasMatchingRoomTile(tileX + 1, tileY, 'OFFICE', floor.roomId, 'RIGHT', 'office')
-      ) {
-        const isRightActive = this.activeOfficeTiles.has(this.cellKey(tileX + 1, tileY));
-        const frameId: RoomSpriteFrameId =
-          isActive || isRightActive ? 'office_active_wide' : 'office_wide';
-        return this.drawRoomSpriteFrame(frameId, pixelX, pixelY);
-      }
-
-      return this.drawRoomSpriteFrame(isActive ? 'office_active_single' : 'office_single', pixelX, pixelY);
-    }
-
-    if (floor.zone === 'CONDO') {
-      const span = floor.condoSpan ?? 'SINGLE';
-
-      if (
-        span === 'RIGHT' &&
-        this.hasMatchingRoomTile(tileX - 1, tileY, 'CONDO', floor.roomId, 'LEFT', 'condo')
-      ) {
-        return true;
-      }
-
-      if (
-        span === 'LEFT' &&
-        this.hasMatchingRoomTile(tileX + 1, tileY, 'CONDO', floor.roomId, 'RIGHT', 'condo')
-      ) {
-        return this.drawRoomSpriteFrame('condo_wide', pixelX, pixelY);
-      }
-
-      return this.drawRoomSpriteFrame('condo_single', pixelX, pixelY);
-    }
-
-    if (floor.zone === 'FOOD_COURT') {
-      const roomId = floor.roomId;
-      if (roomId !== null && this.hasMatchingRoomTile(tileX - 1, tileY, 'FOOD_COURT', roomId, null, null)) {
-        return true;
-      }
-
-      const width =
-        roomId !== null ? this.measureRoomWidth(tileX, tileY, 'FOOD_COURT', roomId, 3) : 1;
-      const frameId: RoomSpriteFrameId =
-        width >= 3 ? 'food_court_triple' : width === 2 ? 'food_court_wide' : 'food_court_single';
-      return this.drawRoomSpriteFrame(frameId, pixelX, pixelY);
-    }
-
-    return false;
-  }
-
-  private drawRoomSpriteFrame(frameId: RoomSpriteFrameId, pixelX: number, pixelY: number): boolean {
-    if (!this.roomSpriteSheetLoaded || !this.roomSpriteSheet) {
-      return false;
-    }
-
-    const frame = ROOM_SPRITE_FRAMES[frameId];
-    if (!frame) {
-      return false;
-    }
-
-    this.worldContext.drawImage(
-      this.roomSpriteSheet,
-      frame.sx,
-      frame.sy,
-      frame.sw,
-      frame.sh,
-      pixelX,
-      pixelY,
-      this.grid.cellSize * frame.tilesWide,
-      this.grid.cellSize,
-    );
-    return true;
-  }
-
   private refreshOfficeOccupancy(): void {
     const officeTiles = new Set<string>();
+    const roomTiles = new Set<string>();
     for (const floorEntity of this.world.query('position', 'floor')) {
       const position = this.world.getComponent(floorEntity, 'position');
       const floor = this.world.getComponent(floorEntity, 'floor');
-      if (!position || !floor || !floor.occupied || floor.zone !== 'OFFICE') {
+      if (!position || !floor || !floor.occupied) {
         continue;
       }
 
-      officeTiles.add(this.cellKey(position.x, position.y));
+      const key = this.cellKey(position.x, position.y);
+      if (floor.zone === 'OFFICE') {
+        officeTiles.add(key);
+        roomTiles.add(key);
+      } else if (floor.zone === 'CONDO' || floor.zone === 'FOOD_COURT') {
+        roomTiles.add(key);
+      }
     }
 
     const activeOfficeTiles = new Set<string>();
@@ -1878,10 +1715,10 @@ export class Game {
       const tileX = Math.round(position.x);
       const tileY = Math.round(position.y);
       const tileKey = this.cellKey(tileX, tileY);
-      const isInsideOffice = agent.phase === 'AT_TARGET' && officeTiles.has(tileKey);
+      const isInsideRoom = agent.phase === 'AT_TARGET' && roomTiles.has(tileKey);
 
-      renderable.hidden = isInsideOffice;
-      if (isInsideOffice) {
+      renderable.hidden = isInsideRoom;
+      if (isInsideRoom && officeTiles.has(tileKey)) {
         activeOfficeTiles.add(tileKey);
       }
     }
@@ -1910,55 +1747,6 @@ export class Game {
     }
 
     return null;
-  }
-
-  private hasMatchingRoomTile(
-    x: number,
-    y: number,
-    zone: RoomZone,
-    roomId: number | null,
-    expectedSpan: 'LEFT' | 'RIGHT' | null,
-    spanKind: 'office' | 'condo' | null,
-  ): boolean {
-    const floor = this.getFloorAt(x, y);
-    if (!floor || !floor.occupied || floor.zone !== zone) {
-      return false;
-    }
-
-    if (roomId !== null && floor.roomId !== roomId) {
-      return false;
-    }
-
-    if (expectedSpan && spanKind === 'office' && floor.officeSpan !== expectedSpan) {
-      return false;
-    }
-
-    if (expectedSpan && spanKind === 'condo' && floor.condoSpan !== expectedSpan) {
-      return false;
-    }
-
-    return true;
-  }
-
-  private measureRoomWidth(
-    x: number,
-    y: number,
-    zone: RoomZone,
-    roomId: number,
-    maxWidth: number,
-  ): number {
-    let width = 0;
-
-    for (let offset = 0; offset < maxWidth; offset += 1) {
-      const floor = this.getFloorAt(x + offset, y);
-      if (!floor || !floor.occupied || floor.zone !== zone || floor.roomId !== roomId) {
-        break;
-      }
-
-      width += 1;
-    }
-
-    return Math.max(1, width);
   }
 
   private getRoomTilesByRoomId(

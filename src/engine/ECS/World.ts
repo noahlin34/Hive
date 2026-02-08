@@ -22,6 +22,13 @@ export interface Renderable {
 
 export type AgentMood = 'happy' | 'neutral' | 'angry';
 export type AgentArchetype = 'VISITOR' | 'RESIDENT' | 'OFFICE_WORKER';
+export type PersonRole =
+  | 'JANITOR'
+  | 'VIP'
+  | 'SECURITY'
+  | 'OFFICE_WORKER'
+  | 'VISITOR'
+  | 'RESIDENT';
 export type AgentRoutine =
   | 'VISITING'
   | 'SHOPPING'
@@ -45,6 +52,7 @@ export type TravelDirection = 'UP' | 'DOWN' | 'NONE';
 
 export interface Agent {
   name: string;
+  role: PersonRole;
   archetype: AgentArchetype;
   routine: AgentRoutine;
   mood: AgentMood;
@@ -196,8 +204,17 @@ const STRESS_GAIN_PER_SECOND = 6;
 const STRESS_DECAY_PER_SECOND = 2.2;
 
 const DISPATCH_DIRECTION_PENALTY = 8;
-const AGENT_SPRITE_PATH = '/agent.png';
+const HUMAN_BASE_SPRITE_PATH = '/human_base.png';
 const AGENT_FACING_EPSILON = 0.002;
+
+export const PERSON_ROLE_COLORS: Record<PersonRole, string> = {
+  JANITOR: '#f59e0b',
+  VIP: '#a855f7',
+  SECURITY: '#06b6d4',
+  OFFICE_WORKER: '#2563eb',
+  VISITOR: '#e11d48',
+  RESIDENT: '#16a34a',
+};
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -249,6 +266,16 @@ function dedupeStops(stops: number[]): number[] {
 function pseudoRandom(seed: number): number {
   const x = Math.sin(seed * 12.9898) * 43758.5453;
   return x - Math.floor(x);
+}
+
+export function createPersonAgent(
+  role: PersonRole,
+  seed: Omit<Agent, 'role'>,
+): Agent {
+  return {
+    ...seed,
+    role,
+  };
 }
 
 export class ECSWorld {
@@ -326,20 +353,20 @@ export class ECSWorld {
 export class RenderSystem {
   private readonly world: ECSWorld;
   private readonly projector: GridProjector;
-  private agentSprite: HTMLCanvasElement | null = null;
-  private agentSpriteLoaded = false;
+  private readonly spriteTintingSystem: SpriteTintingSystem;
   private readonly agentFacingRight = new Map<EntityId, boolean>();
   private readonly previousAgentX = new Map<EntityId, number>();
 
   public constructor(world: ECSWorld, projector: GridProjector) {
     this.world = world;
     this.projector = projector;
-    this.loadAgentSprite(AGENT_SPRITE_PATH);
+    this.spriteTintingSystem = new SpriteTintingSystem(HUMAN_BASE_SPRITE_PATH);
   }
 
   public render(ctx: CanvasRenderingContext2D): void {
     this.renderElevatorCables(ctx);
     this.renderShapes(ctx);
+    this.renderRoomOccupancy(ctx);
     this.renderCondoWarnings(ctx);
     this.renderFloatingText(ctx);
   }
@@ -447,15 +474,23 @@ export class RenderSystem {
       const drawX = pixelX + offset;
       const drawY = pixelY + offset;
 
-      if (agent && this.agentSpriteLoaded && this.agentSprite) {
+      if (agent) {
         const facingRight = this.agentFacingRight.get(entityId) ?? true;
+        const walkerSprite = this.spriteTintingSystem.getTintedSprite('#000000');
+
+        if (!walkerSprite) {
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(drawX, drawY, size, size);
+          continue;
+        }
+
         if (facingRight) {
-          ctx.drawImage(this.agentSprite, drawX, drawY, size, size);
+          ctx.drawImage(walkerSprite, drawX, drawY, size, size);
         } else {
           ctx.save();
           ctx.translate(drawX + size, drawY);
           ctx.scale(-1, 1);
-          ctx.drawImage(this.agentSprite, 0, 0, size, size);
+          ctx.drawImage(walkerSprite, 0, 0, size, size);
           ctx.restore();
         }
       } else {
@@ -494,74 +529,57 @@ export class RenderSystem {
     }
   }
 
-  private loadAgentSprite(path: string): void {
-    const image = new Image();
-    image.onload = () => {
-      this.agentSprite = this.chromaKeySprite(image);
-      this.agentSpriteLoaded = this.agentSprite !== null;
-    };
-    image.onerror = () => {
-      this.agentSprite = null;
-      this.agentSpriteLoaded = false;
-    };
-    image.src = path;
-  }
+  private renderRoomOccupancy(ctx: CanvasRenderingContext2D): void {
+    const hiddenByTile = new Map<string, { x: number; y: number; roles: PersonRole[] }>();
 
-  private chromaKeySprite(image: HTMLImageElement): HTMLCanvasElement | null {
-    const canvas = document.createElement('canvas');
-    canvas.width = image.naturalWidth || image.width;
-    canvas.height = image.naturalHeight || image.height;
-
-    if (canvas.width === 0 || canvas.height === 0) {
-      return null;
-    }
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      return null;
-    }
-
-    ctx.drawImage(image, 0, 0);
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const pixels = imageData.data;
-
-    for (let index = 0; index < pixels.length; index += 4) {
-      const r = pixels[index];
-      const g = pixels[index + 1];
-      const b = pixels[index + 2];
-      const a = pixels[index + 3];
-      const maxOther = Math.max(r, b);
-      const greenDominance = g - maxOther;
-
-      // Treat strongly green-dominant pixels as key candidates.
-      if (g < 72 || greenDominance < 18) {
+    for (const entityId of this.world.query('position', 'agent', 'renderable')) {
+      const position = this.world.getComponent(entityId, 'position');
+      const agent = this.world.getComponent(entityId, 'agent');
+      const renderable = this.world.getComponent(entityId, 'renderable');
+      if (!position || !agent || !renderable || !renderable.hidden) {
         continue;
       }
 
-      // Hard-kill near pure greens.
-      if (g >= 190 && r <= 110 && b <= 110 && greenDominance >= 70) {
-        pixels[index + 3] = 0;
-        continue;
-      }
+      const tileX = Math.round(position.x);
+      const tileY = Math.round(position.y);
+      const key = `${tileX},${tileY}`;
+      const existing = hiddenByTile.get(key) ?? {
+        x: tileX,
+        y: tileY,
+        roles: [],
+      };
 
-      // Soft key + despill for edge pixels to prevent green fringe.
-      const dominanceStrength = clamp((greenDominance - 18) / 78, 0, 1);
-      const greenStrength = clamp((g - 72) / 160, 0, 1);
-      const keyStrength = dominanceStrength * greenStrength;
-
-      if (keyStrength <= 0) {
-        continue;
-      }
-
-      const nextAlpha = Math.round(a * (1 - keyStrength));
-      pixels[index + 3] = nextAlpha < 10 ? 0 : nextAlpha;
-
-      const despill = keyStrength * 0.78;
-      pixels[index + 1] = Math.round(g - (g - maxOther) * despill);
+      existing.roles.push(agent.role);
+      hiddenByTile.set(key, existing);
     }
 
-    ctx.putImageData(imageData, 0, 0);
-    return canvas;
+    for (const bucket of hiddenByTile.values()) {
+      const tilePixel = this.projector.gridToScreen(bucket.x, bucket.y);
+      const slotSize = this.projector.cellSize * 0.34;
+      const maxPerRow = 3;
+      const limit = Math.min(bucket.roles.length, 9);
+
+      for (let index = 0; index < limit; index += 1) {
+        const role = bucket.roles[index];
+        const roleColor = PERSON_ROLE_COLORS[role] ?? '#111827';
+        const tint = this.spriteTintingSystem.getTintedSprite(roleColor);
+
+        const column = index % maxPerRow;
+        const row = Math.floor(index / maxPerRow);
+        const drawX =
+          tilePixel.x + 4 + column * (slotSize * 0.92);
+        const drawY =
+          tilePixel.y + this.projector.cellSize - slotSize - 4 - row * (slotSize * 0.88);
+
+        if (tint) {
+          ctx.drawImage(tint, drawX, drawY, slotSize, slotSize);
+          continue;
+        }
+
+        ctx.fillStyle = roleColor;
+        ctx.fillRect(drawX, drawY, slotSize * 0.7, slotSize * 0.7);
+      }
+    }
   }
 
   private renderCondoWarnings(ctx: CanvasRenderingContext2D): void {
@@ -617,6 +635,79 @@ export class RenderSystem {
 
     ctx.restore();
   }
+}
+
+class SpriteTintingSystem {
+  private readonly basePath: string;
+  private baseImage: HTMLImageElement | null = null;
+  private baseReady = false;
+  private readonly tintCache = new Map<string, HTMLCanvasElement>();
+
+  public constructor(basePath: string) {
+    this.basePath = basePath;
+    this.load();
+  }
+
+  public getTintedSprite(hexColor: string): HTMLCanvasElement | null {
+    const color = normalizeHexColor(hexColor);
+    if (!this.baseReady || !this.baseImage) {
+      return null;
+    }
+
+    const existing = this.tintCache.get(color);
+    if (existing) {
+      return existing;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = this.baseImage.naturalWidth || this.baseImage.width;
+    canvas.height = this.baseImage.naturalHeight || this.baseImage.height;
+    if (canvas.width === 0 || canvas.height === 0) {
+      return null;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.drawImage(this.baseImage, 0, 0);
+    ctx.globalCompositeOperation = 'source-in';
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = 'source-over';
+
+    this.tintCache.set(color, canvas);
+    return canvas;
+  }
+
+  private load(): void {
+    const image = new Image();
+    image.onload = () => {
+      this.baseImage = image;
+      this.baseReady = true;
+      this.tintCache.clear();
+    };
+    image.onerror = () => {
+      this.baseImage = null;
+      this.baseReady = false;
+      this.tintCache.clear();
+    };
+    image.src = this.basePath;
+  }
+}
+
+function normalizeHexColor(input: string): string {
+  const value = input.trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(value)) {
+    return value;
+  }
+
+  if (/^#[0-9a-f]{3}$/.test(value)) {
+    return `#${value[1]}${value[1]}${value[2]}${value[2]}${value[3]}${value[3]}`;
+  }
+
+  return '#000000';
 }
 
 export class MouseSystem {
